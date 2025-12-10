@@ -302,30 +302,95 @@ setTimeout(() => {
   }, 30000); // Every 30 seconds
 }, 2000); // Wait 2 seconds for server to be ready
 
-// GET /api/options-flow - Get recent options flow
+// GET /api/options-flow - Get recent options flow with comprehensive filtering
 router.get('/', async (req, res) => {
   try {
     const {
-      minPremium = 0, // Start with 0 to show all trades, can filter later
+      // Pagination
       limit = 20,
       page = 1,
+      
+      // Basic filters
       ticker,
       type, // 'CALL' or 'PUT'
-      tradeType, // 'SWEEP', 'BLOCK', etc.
+      tradeType, // 'SWEEP', 'BLOCK', 'SPLIT', etc.
+      
+      // Premium filters
+      minPremium = 0,
+      maxPremium,
+      minPremiums,
+      maxPremiums,
+      
+      // Strike filters
+      minStrike,
+      maxStrike,
+      
+      // Bid/Ask filters
+      minBidask,
+      maxBidask,
+      
+      // Type filters (from frontend activeFilters array)
+      calls,
+      puts,
+      bought,
+      sold,
+      complex,
+      sweeps,
+      splits,
+      blocks,
+      aboveAsk,
+      belowBid,
+      itm,
+      otm,
+      volGtOi,
+      shortExpiry,
+      leaps,
+      premium1m,
+      nonEtf,
+      nonSpreads,
+      spreads,
+      openingOrder,
+      openingSpread,
+      preEarnings,
+      postEarnings,
+      ssr,
+      repeatFlow,
+      
+      // Range filters
+      dte, // Comma-separated: "0,1,3,7,15,30,60,90"
+      stockPrice, // Comma-separated: "< $25,$25 - $75,$75 - $150,> $150"
+      openInterest, // Comma-separated: "< 1k,1k to 5k,5k to 25k,> 25k"
+      volume, // Comma-separated: "< 1k,1k to 5k,5k to 25k,> 25k"
+      
+      // Exclude symbols
+      excludeSymbols, // Comma-separated list
     } = req.query;
 
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 20;
     const offset = (pageNum - 1) * limitNum;
 
-    console.log('📥 Options flow request:', {
+    console.log('📥 Options flow request with filters:', {
       minPremium,
+      maxPremium,
+      minPremiums,
+      maxPremiums,
+      minStrike,
+      maxStrike,
+      minBidask,
+      maxBidask,
       limit: limitNum,
       page: pageNum,
       offset,
       ticker,
       type,
       tradeType,
+      calls,
+      puts,
+      dte,
+      stockPrice,
+      openInterest,
+      volume,
       storeSize: tradesStore.size,
     });
 
@@ -344,7 +409,62 @@ router.get('/', async (req, res) => {
     const allTradesRaw = Array.from(tradesStore.values());
     console.log(`📊 Total trades in store: ${allTradesRaw.length}`);
     
-    // Filter trades
+    // Helper function to parse premium value
+    const parsePremium = (premiumStr) => {
+      if (typeof premiumStr === 'number') return premiumStr;
+      const num = parseFloat(premiumStr.replace(/[^0-9.]/g, ''));
+      if (premiumStr.includes('M')) return num * 1000000;
+      if (premiumStr.includes('K')) return num * 1000;
+      return num;
+    };
+    
+    // Helper function to parse range filters for volume
+    const parseVolumeRange = (vol, ranges) => {
+      if (!ranges) return true;
+      const selectedRanges = Array.isArray(ranges) ? ranges : ranges.split(',');
+      return selectedRanges.some(range => {
+        const num = parseFloat(vol || 0);
+        if (range === '< 1k') return num < 1000;
+        if (range === '1k to 5k') return num >= 1000 && num < 5000;
+        if (range === '5k to 25k') return num >= 5000 && num < 25000;
+        if (range === '> 25k') return num >= 25000;
+        return false;
+      });
+    };
+    
+    // Helper function to check DTE
+    const checkDTE = (dteStr, selectedDTEs) => {
+      if (!selectedDTEs || selectedDTEs.length === 0) return true;
+      const dteNum = parseInt(dteStr.replace('d', '')) || 0;
+      return selectedDTEs.includes(dteNum);
+    };
+    
+    // Helper function to check stock price range
+    const checkStockPrice = (spotPrice, selectedRanges) => {
+      if (!selectedRanges || selectedRanges.length === 0) return true;
+      const price = parseFloat(spotPrice.replace(/[^0-9.]/g, '')) || 0;
+      return selectedRanges.some(range => {
+        if (range === '< $25') return price < 25;
+        if (range === '$25 - $75') return price >= 25 && price < 75;
+        if (range === '$75 - $150') return price >= 75 && price < 150;
+        if (range === '> $150') return price >= 150;
+        return false;
+      });
+    };
+    
+    // Helper function to check OI range
+    const checkOIRange = (oi, selectedRanges) => {
+      if (!selectedRanges || selectedRanges.length === 0) return true;
+      return selectedRanges.some(range => {
+        if (range === '< 1k') return oi < 1000;
+        if (range === '1k to 5k') return oi >= 1000 && oi < 5000;
+        if (range === '5k to 25k') return oi >= 5000 && oi < 25000;
+        if (range === '> 25k') return oi >= 25000;
+        return false;
+      });
+    };
+    
+    // Filter trades with comprehensive filtering
     const filteredTrades = allTradesRaw
       .filter(trade => {
         // Filter out arrays (grouped trades)
@@ -352,18 +472,80 @@ router.get('/', async (req, res) => {
           return false;
         }
         
-        // Filter by premium
-        const premiumNum = trade.premiumRaw || parseFloat(trade.premium.replace(/[^0-9.]/g, '')) * 
-          (trade.premium.includes('M') ? 1000000 : (trade.premium.includes('K') ? 1000 : 1));
-        if (premiumNum < minPremium) {
-          return false;
+        // Exclude symbols filter
+        if (excludeSymbols) {
+          const excluded = excludeSymbols.split(',').map(s => s.trim().toUpperCase());
+          if (excluded.includes(trade.ticker?.toUpperCase())) return false;
         }
         
-        // Filter by ticker
-        if (ticker && trade.ticker !== ticker.toUpperCase()) return false;
+        // Premium filters
+        const premiumNum = trade.premiumRaw || parsePremium(trade.premium);
+        if (premiumNum < minPremium) return false;
+        if (maxPremium && premiumNum > parseFloat(maxPremium)) return false;
+        if (minPremiums && premiumNum < parseFloat(minPremiums)) return false;
+        if (maxPremiums && premiumNum > parseFloat(maxPremiums)) return false;
         
-        // Filter by type
+        // Strike filters
+        if (minStrike && trade.strike < parseFloat(minStrike)) return false;
+        if (maxStrike && trade.strike > parseFloat(maxStrike)) return false;
+        
+        // Bid/Ask filters (would need bid/ask data in trade object)
+        // if (minBidask && trade.bidask < parseFloat(minBidask)) return false;
+        // if (maxBidask && trade.bidask > parseFloat(maxBidask)) return false;
+        
+        // Type filters
+        if (calls === 'true' && trade.type !== 'CALL') return false;
+        if (puts === 'true' && trade.type !== 'PUT') return false;
         if (type && trade.type !== type.toUpperCase()) return false;
+        
+        // Trade type filters
+        if (sweeps === 'true' && trade.tradeType !== 'SWEEP') return false;
+        if (blocks === 'true' && trade.tradeType !== 'BLOCK') return false;
+        if (splits === 'true' && trade.tradeType !== 'SPLIT') return false;
+        if (tradeType && trade.tradeType !== tradeType.toUpperCase()) return false;
+        
+        // ITM/OTM filters
+        if (itm === 'true' && trade.moneyness !== 'ITM') return false;
+        if (otm === 'true' && trade.moneyness !== 'OTM') return false;
+        
+        // Volume > OI filter
+        if (volGtOi === 'true' && trade.volume <= trade.oi) return false;
+        
+        // DTE filter
+        if (dte) {
+          const selectedDTEs = dte.split(',').map(d => parseInt(d.trim())).filter(d => !isNaN(d));
+          if (!checkDTE(trade.dte, selectedDTEs)) return false;
+        }
+        
+        // Short Expiry / LEAPS filter
+        const dteNum = parseInt(trade.dte?.replace('d', '')) || 0;
+        if (shortExpiry === 'true' && dteNum > 30) return false;
+        if (leaps === 'true' && dteNum < 365) return false;
+        
+        // Premium > $1M filter
+        if (premium1m === 'true' && premiumNum < 1000000) return false;
+        
+        // Stock Price range filter
+        if (stockPrice) {
+          const selectedRanges = stockPrice.split(',');
+          if (!checkStockPrice(trade.spot, selectedRanges)) return false;
+        }
+        
+        // Open Interest range filter
+        if (openInterest) {
+          const selectedRanges = openInterest.split(',');
+          if (!checkOIRange(trade.oi || 0, selectedRanges)) return false;
+        }
+        
+        // Volume range filter
+        if (volume) {
+          const selectedRanges = volume.split(',');
+          const vol = trade.volume || trade.size || 0;
+          if (!parseVolumeRange(vol, selectedRanges)) return false;
+        }
+        
+        // Ticker filter
+        if (ticker && trade.ticker !== ticker.toUpperCase()) return false;
         
         return true;
       })
