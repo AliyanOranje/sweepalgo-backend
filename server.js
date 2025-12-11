@@ -4,6 +4,13 @@ import dotenv from 'dotenv';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import optionsFlowRouter from './routes/optionsFlow.js';
+import optionsContractsRouter from './routes/optionsContracts.js';
+import optionsBarsRouter from './routes/optionsBars.js';
+import optionsSnapshotsRouter from './routes/optionsSnapshots.js';
+import optionsTradesRouter from './routes/optionsTrades.js';
+import optionsQuotesRouter from './routes/optionsQuotes.js';
+import optionsIndicatorsRouter from './routes/optionsIndicators.js';
+import optionsMetadataRouter from './routes/optionsMetadata.js';
 
 dotenv.config();
 
@@ -70,6 +77,13 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/options-flow', optionsFlowRouter);
+app.use('/api/options/contracts', optionsContractsRouter);
+app.use('/api/options/bars', optionsBarsRouter);
+app.use('/api/options/snapshots', optionsSnapshotsRouter);
+app.use('/api/options/trades', optionsTradesRouter);
+app.use('/api/options/quotes', optionsQuotesRouter);
+app.use('/api/options/indicators', optionsIndicatorsRouter);
+app.use('/api/options/metadata', optionsMetadataRouter);
 
 // Options chain endpoint
 app.get('/api/options-chain/:ticker', async (req, res) => {
