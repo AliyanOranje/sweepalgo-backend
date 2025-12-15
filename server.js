@@ -133,10 +133,46 @@ app.get('/api/gex/:ticker', async (req, res) => {
 
 // WebSocket server for real-time data
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ 
+  server,
+  path: '/ws', // BUG #16 FIX: Set WebSocket path
+});
+
+// Store connected clients and their subscriptions
+const clients = new Set();
+const clientSubscriptions = new Map(); // Map<WebSocket, Set<ticker>>
+
+// BUG #16 FIX: Function to broadcast trade updates to subscribed clients
+function broadcastTradeUpdate(trade) {
+  const message = JSON.stringify({
+    type: 'options-trade',
+    data: trade,
+    timestamp: new Date().toISOString(),
+  });
+  
+  clients.forEach((client) => {
+    if (client.readyState === 1) { // WebSocket.OPEN
+      const subscriptions = clientSubscriptions.get(client) || new Set();
+      // If no specific ticker subscription, send all trades
+      // If subscribed to specific ticker, only send matching trades
+      if (subscriptions.size === 0 || subscriptions.has(trade.ticker) || subscriptions.has('*')) {
+        try {
+          client.send(message);
+        } catch (error) {
+          console.error('Error sending WebSocket message:', error);
+        }
+      }
+    }
+  });
+}
+
+// Make broadcastTradeUpdate available globally for optionsFlow route
+global.broadcastTradeUpdate = broadcastTradeUpdate;
 
 wss.on('connection', (ws) => {
   console.log('✅ Client connected to WebSocket');
+  clients.add(ws);
+  clientSubscriptions.set(ws, new Set());
   
   // Send welcome message
   ws.send(JSON.stringify({
@@ -150,13 +186,56 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message.toString());
       console.log('Received from client:', data);
       
-      // Handle subscriptions
+      // BUG #16 FIX: Handle subscriptions
       if (data.type === 'subscribe' && data.channel === 'options-flow') {
         ws.send(JSON.stringify({
           type: 'subscribed',
           channel: 'options-flow',
           message: 'Subscribed to options flow updates',
         }));
+      }
+      
+      // BUG #2 FIX: Handle ticker-specific subscriptions
+      if (data.type === 'subscribe-ticker') {
+        const ticker = data.ticker?.toUpperCase();
+        const subscriptions = clientSubscriptions.get(ws) || new Set();
+        
+        if (ticker) {
+          subscriptions.add(ticker);
+          clientSubscriptions.set(ws, subscriptions);
+          ws.send(JSON.stringify({
+            type: 'subscribed-ticker',
+            ticker: ticker,
+            message: `Subscribed to ${ticker} options flow`,
+          }));
+          console.log(`📡 Client subscribed to ticker: ${ticker}`);
+        } else {
+          // Subscribe to all tickers
+          subscriptions.add('*');
+          clientSubscriptions.set(ws, subscriptions);
+          ws.send(JSON.stringify({
+            type: 'subscribed-ticker',
+            ticker: '*',
+            message: 'Subscribed to all tickers',
+          }));
+        }
+      }
+      
+      // BUG #2 FIX: Handle ticker unsubscriptions
+      if (data.type === 'unsubscribe-ticker') {
+        const ticker = data.ticker?.toUpperCase();
+        const subscriptions = clientSubscriptions.get(ws) || new Set();
+        
+        if (ticker) {
+          subscriptions.delete(ticker);
+          subscriptions.delete('*');
+          clientSubscriptions.set(ws, subscriptions);
+          ws.send(JSON.stringify({
+            type: 'unsubscribed-ticker',
+            ticker: ticker,
+            message: `Unsubscribed from ${ticker}`,
+          }));
+        }
       }
     } catch (error) {
       console.error('Error parsing client message:', error);
@@ -165,10 +244,14 @@ wss.on('connection', (ws) => {
   
   ws.on('close', () => {
     console.log('❌ Client disconnected from WebSocket');
+    clients.delete(ws);
+    clientSubscriptions.delete(ws);
   });
   
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
+    clients.delete(ws);
+    clientSubscriptions.delete(ws);
   });
 });
 
