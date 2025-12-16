@@ -366,6 +366,16 @@ router.get('/', async (req, res) => {
       openInterest, // Comma-separated: "< 1k,1k to 5k,5k to 25k,> 25k"
       volume, // Comma-separated: "< 1k,1k to 5k,5k to 25k,> 25k"
       
+      // Advanced Filters section filters
+      filterTicker, // Ticker symbol filter from Advanced Filters
+      filterMinPremium, // Min premium from Advanced Filters
+      minVolume, // Min volume filter
+      filterMaxDte, // Max DTE filter
+      minConfidence, // Min confidence score filter
+      
+      // Sorting
+      sortBy, // Sort by: 'time', 'premium', 'volume', 'confidence', 'iv'
+      
       // Exclude symbols
       excludeSymbols, // Comma-separated list
     } = req.query;
@@ -391,6 +401,7 @@ router.get('/', async (req, res) => {
       stockPrice: stockPrice,
       openInterest: openInterest,
       volume: volume,
+      sortBy: sortBy, sortByType: typeof sortBy,
     });
 
     // If user searched a ticker, fetch directly from API for that ticker (server-side filter)
@@ -499,25 +510,62 @@ router.get('/', async (req, res) => {
         if (maxPremium && premiumNum > parseFloat(maxPremium)) return false;
         if (minPremiums && premiumNum < parseFloat(minPremiums)) return false;
         if (maxPremiums && premiumNum > parseFloat(maxPremiums)) return false;
+        // Advanced Filters: filterMinPremium
+        if (filterMinPremium && premiumNum < parseFloat(filterMinPremium)) return false;
         
         // Strike filters
         if (minStrike && trade.strike < parseFloat(minStrike)) return false;
         if (maxStrike && trade.strike > parseFloat(maxStrike)) return false;
         
-        // Bid/Ask filters (would need bid/ask data in trade object)
-        // if (minBidask && trade.bidask < parseFloat(minBidask)) return false;
-        // if (maxBidask && trade.bidask > parseFloat(maxBidask)) return false;
+        // Bid/Ask spread filters - calculate spread from bid and ask
+        if (minBidask || maxBidask) {
+          const bid = trade.bid || 0;
+          const ask = trade.ask || 0;
+          const bidaskSpread = (bid > 0 && ask > 0) ? (ask - bid) : 0;
+          
+          if (minBidask && bidaskSpread < parseFloat(minBidask)) return false;
+          if (maxBidask && bidaskSpread > parseFloat(maxBidask)) return false;
+        }
         
-        // Type filters - use helper function to check if filter is active
-        if (isFilterActive(calls) && trade.type !== 'CALL') return false;
-        if (isFilterActive(puts) && trade.type !== 'PUT') return false;
-        if (type && trade.type !== type.toUpperCase()) return false;
+        // Type filters (CALL/PUT) - use helper function to check if filter is active
+        // CRITICAL: Only apply CALL/PUT filter if it's explicitly set (don't show both if both are set)
+        const shouldShowCalls = isFilterActive(calls);
+        const shouldShowPuts = isFilterActive(puts);
+        const typeFilter = type ? type.toUpperCase() : null;
         
-        // Trade type filters - use helper function to check if filter is active
-        if (isFilterActive(sweeps) && trade.tradeType !== 'SWEEP') return false;
-        if (isFilterActive(blocks) && trade.tradeType !== 'BLOCK') return false;
-        if (isFilterActive(splits) && trade.tradeType !== 'SPLIT') return false;
-        if (tradeType && trade.tradeType !== tradeType.toUpperCase()) return false;
+        // If CALL filter is active, only show CALLs
+        if (shouldShowCalls && !shouldShowPuts && trade.type !== 'CALL') return false;
+        // If PUT filter is active, only show PUTs
+        if (shouldShowPuts && !shouldShowCalls && trade.type !== 'PUT') return false;
+        // If both are active, show both (no filter)
+        // If type parameter is set, use it
+        if (typeFilter && trade.type !== typeFilter) return false;
+        
+        // Trade type filters (SWEEP/BLOCK/SPLIT) - use helper function to check if filter is active
+        // CRITICAL: Only apply trade type filter if it's explicitly set (don't show multiple types if multiple are set)
+        const shouldShowSweeps = isFilterActive(sweeps);
+        const shouldShowBlocks = isFilterActive(blocks);
+        const shouldShowSplits = isFilterActive(splits);
+        const tradeTypeFilter = tradeType ? tradeType.toUpperCase() : null;
+        
+        // Count how many trade type filters are active
+        const activeTradeTypeFilters = [shouldShowSweeps, shouldShowBlocks, shouldShowSplits].filter(Boolean).length;
+        
+        // If exactly one trade type filter is active, enforce it strictly
+        if (activeTradeTypeFilters === 1) {
+          if (shouldShowSweeps && trade.tradeType !== 'SWEEP') return false;
+          if (shouldShowBlocks && trade.tradeType !== 'BLOCK') return false;
+          if (shouldShowSplits && trade.tradeType !== 'SPLIT') return false;
+        }
+        // If multiple trade type filters are active, show trades matching any of them (OR logic)
+        else if (activeTradeTypeFilters > 1) {
+          const matchesAny = (shouldShowSweeps && trade.tradeType === 'SWEEP') ||
+                            (shouldShowBlocks && trade.tradeType === 'BLOCK') ||
+                            (shouldShowSplits && trade.tradeType === 'SPLIT');
+          if (!matchesAny) return false;
+        }
+        // If tradeType parameter is set, use it
+        if (tradeTypeFilter && trade.tradeType !== tradeTypeFilter) return false;
         
         // ITM/OTM filters - use helper function to check if filter is active
         if (isFilterActive(itm) && trade.moneyness !== 'ITM') return false;
@@ -563,17 +611,102 @@ router.get('/', async (req, res) => {
           if (!parseVolumeRange(vol, selectedRanges)) return false;
         }
         
-        // Ticker filter
-        if (ticker && trade.ticker !== ticker.toUpperCase()) return false;
+        // Advanced Filters: minVolume
+        if (minVolume) {
+          const vol = trade.volume || trade.size || 0;
+          if (vol < parseFloat(minVolume)) return false;
+        }
+        
+        // Advanced Filters: filterMaxDte
+        if (filterMaxDte) {
+          const maxDteNum = parseInt(filterMaxDte) || 999;
+          const dteNum = parseInt(trade.dte?.replace('d', '')) || 0;
+          if (dteNum > maxDteNum) return false;
+        }
+        
+        // Advanced Filters: minConfidence
+        if (minConfidence) {
+          const conf = trade.confidence || 0;
+          if (conf < parseFloat(minConfidence)) return false;
+        }
+        
+        // Ticker filter (from header search OR Advanced Filters)
+        const tickerToFilter = ticker || filterTicker;
+        if (tickerToFilter && trade.ticker !== tickerToFilter.toUpperCase()) return false;
         
         return true;
-      })
-      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      });
+    
+    // CRITICAL: Normalize sortBy parameter (handle both frontend and backend formats)
+    const normalizedSortBy = sortBy ? String(sortBy).toLowerCase() : 'time';
+    console.log(`🔍 Sorting by: "${sortBy}" (normalized: "${normalizedSortBy}")`);
+    
+    // Prepare trades for sorting by ensuring all sort fields have default values
+    const tradesForSorting = filteredTrades.map(trade => ({
+      ...trade,
+      // Ensure confidence has a default value for sorting
+      confidence: trade.confidence !== undefined && trade.confidence !== null ? trade.confidence : 5,
+      // Ensure volume has a default value
+      volume: trade.volume || trade.size || 0,
+      // Ensure premiumRaw exists
+      premiumRaw: trade.premiumRaw || parsePremium(trade.premium),
+    }));
+    
+    // Sort ALL filtered trades BEFORE pagination (CRITICAL FIX for sortBy filter)
+    const sortedTrades = [...tradesForSorting].sort((a, b) => {
+      switch (normalizedSortBy) {
+        case 'premium': {
+          const premiumA = a.premiumRaw || 0;
+          const premiumB = b.premiumRaw || 0;
+          return premiumB - premiumA; // Descending (high to low)
+        }
+        
+        case 'volume': {
+          const volumeA = a.volume || 0;
+          const volumeB = b.volume || 0;
+          return volumeB - volumeA; // Descending (high to low)
+        }
+        
+        case 'confidence': {
+          const confidenceA = a.confidence || 0;
+          const confidenceB = b.confidence || 0;
+          console.log(`🔍 Comparing confidence: ${confidenceA} vs ${confidenceB}`);
+          return confidenceB - confidenceA; // Descending (high to low)
+        }
+        
+        case 'iv': {
+          const parseIV = (ivStr) => {
+            if (!ivStr || ivStr === 'N/A') return 0;
+            return parseFloat(String(ivStr).replace('%', '')) || 0;
+          };
+          const ivA = parseIV(a.iv);
+          const ivB = parseIV(b.iv);
+          return ivB - ivA; // Descending (high to low)
+        }
+        
+        case 'time':
+        default: {
+          // Sort by timestamp (newest first)
+          const timestampA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+          const timestampB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+          return timestampB - timestampA; // Descending (newest first)
+        }
+      }
+    });
+    
+    // Log first few sorted trades for debugging
+    if (normalizedSortBy === 'confidence') {
+      console.log(`🔍 First 5 trades after sorting by confidence:`, sortedTrades.slice(0, 5).map(t => ({
+        ticker: t.ticker,
+        confidence: t.confidence,
+        tradeType: t.tradeType,
+      })));
+    }
 
-    // Calculate pagination
-    const totalCount = filteredTrades.length;
+    // Calculate pagination (AFTER sorting)
+    const totalCount = sortedTrades.length;
     const totalPages = Math.ceil(totalCount / limitNum);
-    const paginatedTrades = filteredTrades.slice(offset, offset + limitNum);
+    const paginatedTrades = sortedTrades.slice(offset, offset + limitNum);
 
     // Enrich trades with additional data (OI, IV, etc.)
     const enrichedTrades = await Promise.all(paginatedTrades.map(async (trade) => {

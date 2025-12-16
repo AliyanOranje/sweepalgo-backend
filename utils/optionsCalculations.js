@@ -419,19 +419,47 @@ function getDirectionArrow(optionType, side) {
 
 /**
  * BUG #13 FIX: Detect opening/closing
+ * Uses heuristics when previous OI is not available
  */
 function detectOpeningClosing(volume, openInterest, previousOI) {
-  // If volume > previous OI, likely opening new positions
-  if (previousOI && volume > previousOI) {
-    return 'Opening';
+  // If we have previous OI, use accurate detection
+  if (previousOI !== null && previousOI !== undefined) {
+    // If volume > previous OI, likely opening new positions
+    if (volume > previousOI) {
+      return 'Opening';
+    }
+    
+    // If current OI < previous OI and volume is high, likely closing
+    if (openInterest < previousOI && volume > openInterest * 0.1) {
+      return 'Closing';
+    }
+    
+    return '';
   }
   
-  // If current OI < previous OI and volume is high, likely closing
-  if (previousOI && openInterest < previousOI && volume > openInterest * 0.1) {
-    return 'Closing';
+  // Heuristic-based detection when previous OI is not available
+  // High volume relative to OI suggests opening new positions
+  if (openInterest > 0 && volume > 0) {
+    const volumeToOIRatio = volume / openInterest;
+    
+    // If volume is a significant portion of OI (>= 50%), likely opening
+    if (volumeToOIRatio >= 0.5) {
+      return 'Opening';
+    }
+    
+    // If volume is very high (>= 1000 contracts) and OI is relatively low, likely opening
+    if (volume >= 1000 && openInterest < volume * 2) {
+      return 'Opening';
+    }
+    
+    // If volume is very low compared to OI (< 5%) and OI is high, might be closing
+    // But this is less reliable without previous OI
+    if (volumeToOIRatio < 0.05 && openInterest >= 1000 && volume < 50) {
+      return 'Closing';
+    }
   }
   
-  // Can't determine
+  // Can't determine with confidence
   return '';
 }
 
