@@ -504,9 +504,15 @@ router.get('/', async (req, res) => {
         if (minStrike && trade.strike < parseFloat(minStrike)) return false;
         if (maxStrike && trade.strike > parseFloat(maxStrike)) return false;
         
-        // Bid/Ask filters (would need bid/ask data in trade object)
-        // if (minBidask && trade.bidask < parseFloat(minBidask)) return false;
-        // if (maxBidask && trade.bidask > parseFloat(maxBidask)) return false;
+        // Bid/Ask spread filters - calculate spread from bid and ask
+        if (minBidask || maxBidask) {
+          const bid = trade.bid || 0;
+          const ask = trade.ask || 0;
+          const bidaskSpread = (bid > 0 && ask > 0) ? (ask - bid) : 0;
+          
+          if (minBidask && bidaskSpread < parseFloat(minBidask)) return false;
+          if (maxBidask && bidaskSpread > parseFloat(maxBidask)) return false;
+        }
         
         // Type filters - use helper function to check if filter is active
         if (isFilterActive(calls) && trade.type !== 'CALL') return false;
