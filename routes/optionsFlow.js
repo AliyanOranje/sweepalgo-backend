@@ -267,13 +267,24 @@ setTimeout(() => {
     console.error('❌ Initial fetch failed:', err.message);
   });
   
-  // Periodic background refresh every 10 seconds - CONTINUOUSLY fetch new data
+  // HYBRID APPROACH: REST polling as fallback/backup
+  // During market hours with active WebSocket: Poll every 60 seconds (backup)
+  // During off-hours or if WebSocket disconnected: Poll every 10 seconds (primary)
   let isFetching = false; // Prevent concurrent fetches
   setInterval(() => {
     if (isFetching) {
       console.log('⏸️ Skipping refresh - fetch already in progress');
       return;
     }
+    
+    const marketStatus = getMarketStatus();
+    const wsActive = isConnected && polygonWS?.readyState === 1; // WebSocket.OPEN
+    
+    // Determine polling interval based on market status and WebSocket connection
+    // If WebSocket is active during market hours, REST is just backup (less frequent)
+    // If WebSocket is inactive or market is closed, REST is primary (more frequent)
+    const shouldUseFrequentPolling = !wsActive || !marketStatus.isOpen;
+    const pollingInterval = shouldUseFrequentPolling ? 10000 : 60000; // 10s vs 60s
     
     // Always refresh to get new live data, but clear old trades first if store is getting full
     if (tradesStore.size > MAX_TRADES * 0.8) {
@@ -291,17 +302,21 @@ setTimeout(() => {
       }
     }
     
-    // Always refresh to get new live data (removed the < 5000 condition)
-    console.log(`🔄 Live refresh triggered (store has ${tradesStore.size} trades, max: ${MAX_TRADES})...`);
+    // Log polling strategy
+    const strategy = wsActive && marketStatus.isOpen 
+      ? '🔄 REST backup polling (WebSocket active)' 
+      : '🔄 REST primary polling (WebSocket inactive or market closed)';
+    console.log(`${strategy} - Store has ${tradesStore.size} trades, max: ${MAX_TRADES}`);
+    
     isFetching = true;
     fetchOptionsFromREST().then(() => {
       isFetching = false;
-      console.log(`✅ Live refresh complete. Store now has ${tradesStore.size} trades.`);
+      console.log(`✅ REST refresh complete. Store now has ${tradesStore.size} trades.`);
     }).catch((err) => {
-      console.error('❌ Live refresh error:', err.message);
+      console.error('❌ REST refresh error:', err.message);
       isFetching = false;
     });
-  }, 10000); // Every 10 seconds
+  }, 10000); // Check every 10 seconds, but actual fetch frequency depends on WebSocket status
 }, 2000);
 
 // GET /api/options-flow - Get recent options flow with comprehensive filtering
