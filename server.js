@@ -11,6 +11,7 @@ import optionsTradesRouter from './routes/optionsTrades.js';
 import optionsQuotesRouter from './routes/optionsQuotes.js';
 import optionsIndicatorsRouter from './routes/optionsIndicators.js';
 import optionsMetadataRouter from './routes/optionsMetadata.js';
+import gexRouter from './routes/gex.js';
 
 dotenv.config();
 
@@ -84,6 +85,7 @@ app.use('/api/options/trades', optionsTradesRouter);
 app.use('/api/options/quotes', optionsQuotesRouter);
 app.use('/api/options/indicators', optionsIndicatorsRouter);
 app.use('/api/options/metadata', optionsMetadataRouter);
+app.use('/api/gex', gexRouter);
 
 // Options chain endpoint
 app.get('/api/options-chain/:ticker', async (req, res) => {
@@ -123,13 +125,7 @@ app.get('/api/options-chain/:ticker', async (req, res) => {
   }
 });
 
-// GEX endpoint (placeholder)
-app.get('/api/gex/:ticker', async (req, res) => {
-  res.json({ 
-    message: 'GEX endpoint - coming soon', 
-    ticker: req.params.ticker 
-  });
-});
+// GEX endpoint is now handled by gexRouter
 
 // WebSocket server for real-time data
 const server = createServer(app);
