@@ -143,18 +143,24 @@ async function processOptionsTrade(trade) {
 
     // BUG #5 FIX: Calculate IV if we have all required data
     let iv = 'N/A';
-    if (spotPrice && strike && expirationDate) {
+    if (spotPrice && strike && expirationDate && p > 0) {
       try {
         const T = (new Date(expirationDate).getTime() - new Date(t).getTime()) / (1000 * 60 * 60 * 24 * 365.25);
         const r = 0.05; // Risk-free rate 5%
         const isCall = type === 'CALL';
         
-        if (T > 0 && p > 0) {
+        // Validate inputs before calculation
+        if (T > 0 && T < 10 && p > 0 && spotPrice > 0 && strike > 0 && 
+            isFinite(T) && isFinite(p) && isFinite(spotPrice) && isFinite(strike)) {
           const ivDecimal = calculateImpliedVolatility(p, spotPrice, strike, T, r, isCall);
-          iv = formatIV(ivDecimal);
+          
+          // Validate calculated IV
+          if (ivDecimal && isFinite(ivDecimal) && ivDecimal > 0 && ivDecimal < 5) {
+            iv = formatIV(ivDecimal);
+          }
         }
       } catch (ivError) {
-        // Silent error handling
+        // Silent error handling - IV calculation failed
       }
     }
 
@@ -209,7 +215,7 @@ async function processOptionsTrade(trade) {
       dte: calculateDTE(expirationDate),
       otm: otm, // BUG #6 FIX: Now calculated correctly
       otmLabel: otmLabel, // Add label for display
-      sentiment: sentiment.toUpperCase(), // BUG #4 FIX: Now based on side detection
+      sentiment: formatSentiment(sentiment), // FIX: Correctly converts Bullish/Bearish to BULL/BEAR
       side: side, // BUG #4 FIX: Add side field
       directionArrow: arrow, // BUG #12 FIX: Add direction arrow
       tradeType: tradeType.toUpperCase(), // BUG #7 & #8 FIX: Now correctly classified
@@ -744,27 +750,102 @@ router.get('/', async (req, res) => {
       // Calculate moneyness using the same function as REST API (consistent with filter logic)
       const moneynessData = calculateMoneyness(spotPrice, trade.strike, trade.type);
       
-      // BUG #5 FIX: Validate and fix IV if it's too high
+      // BUG #5 FIX: Validate and fix IV if it's too high or missing
       let iv = trade.iv || 'N/A';
       if (iv !== 'N/A') {
         const ivNum = parseFloat(iv.replace('%', ''));
-        if (ivNum > 300) {
-          // Try to recalculate
+        if (ivNum > 300 || ivNum < 0 || isNaN(ivNum)) {
+          // Try to recalculate if IV is invalid
           if (trade.price && spotPrice && trade.expirationDate) {
             try {
               const T = (new Date(trade.expirationDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24 * 365.25);
               const r = 0.05;
               const isCall = trade.type === 'CALL';
-              if (T > 0 && trade.price > 0) {
+              
+              // Validate inputs before calculation
+              if (T > 0 && T < 10 && trade.price > 0 && spotPrice > 0 && trade.strike > 0 && 
+                  isFinite(T) && isFinite(trade.price) && isFinite(spotPrice) && isFinite(trade.strike)) {
                 const ivDecimal = calculateImpliedVolatility(trade.price, spotPrice, trade.strike, T, r, isCall);
-                iv = formatIV(ivDecimal);
+                
+                // Validate calculated IV
+                if (ivDecimal && isFinite(ivDecimal) && ivDecimal > 0 && ivDecimal < 5) {
+                  iv = formatIV(ivDecimal);
+                }
               }
             } catch (ivError) {
               // Silent error handling
             }
           }
         }
+      } else if (trade.price && spotPrice && trade.expirationDate) {
+        // Calculate IV if missing
+        try {
+          const T = (new Date(trade.expirationDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24 * 365.25);
+          const r = 0.05;
+          const isCall = trade.type === 'CALL';
+          
+          // Validate inputs before calculation
+          if (T > 0 && T < 10 && trade.price > 0 && spotPrice > 0 && trade.strike > 0 && 
+              isFinite(T) && isFinite(trade.price) && isFinite(spotPrice) && isFinite(trade.strike)) {
+            const ivDecimal = calculateImpliedVolatility(trade.price, spotPrice, trade.strike, T, r, isCall);
+            
+            // Validate calculated IV
+            if (ivDecimal && isFinite(ivDecimal) && ivDecimal > 0 && ivDecimal < 5) {
+              iv = formatIV(ivDecimal);
+            }
+          }
+        } catch (ivError) {
+          // Silent error handling
+        }
       }
+      
+      // Recalculate sentiment if missing or incorrect (should be based on buy/sell + option type, not just option type)
+      let sentiment = trade.sentiment;
+      
+      // Check if sentiment needs recalculation (missing or wrong format)
+      // Note: PUT can be BULL (if sold aggressively) and CALL can be BEAR (if sold aggressively)
+      // So we only check for missing or wrong format, not for "impossible" combinations
+      const needsRecalc = !sentiment || 
+                         sentiment === 'BULLISH' || 
+                         sentiment === 'BEARISH';
+      
+      if (needsRecalc && trade.side && trade.price && trade.type) {
+        // Infer bid/ask from side to recalculate sentiment
+        const side = trade.side.toLowerCase();
+        let bid = 0, ask = 0;
+        let canRecalculate = false;
+        
+        if (side.includes('ask') || side.includes('above') || side.includes('abv')) {
+          // Trade was at/above ask (aggressive buy)
+          ask = trade.price;
+          bid = trade.price * 0.98; // Estimate bid as 2% below
+          canRecalculate = true;
+        } else if (side.includes('bid') || side.includes('below') || side.includes('blw')) {
+          // Trade was at/below bid (aggressive sell)
+          bid = trade.price;
+          ask = trade.price * 1.02; // Estimate ask as 2% above
+          canRecalculate = true;
+        }
+        // If side is "Mid" or "To Ask"/"To Bid", we can't accurately determine aggressiveness
+        // In this case, preserve existing sentiment if valid, otherwise use NEUTRAL
+        
+        // Recalculate sentiment using detectSide if we have valid bid/ask
+        if (canRecalculate && bid > 0 && ask > 0) {
+          const sideData = detectSide(trade.price, bid, ask, trade.type);
+          sentiment = sideData.sentiment; // Returns 'Bullish', 'Bearish', or 'Neutral'
+        } else if (!sentiment) {
+          // If we can't determine and no existing sentiment, use NEUTRAL
+          // Frontend will handle NEUTRAL -> BULL/BEAR conversion if needed
+          sentiment = 'NEUTRAL';
+        }
+        // Otherwise, keep existing sentiment (even if it might be wrong, better than assuming)
+      } else if (!sentiment) {
+        // No sentiment and no side data - use NEUTRAL (don't assume CALL=BULL, PUT=BEAR)
+        sentiment = 'NEUTRAL';
+      }
+      
+      // Format sentiment to BULL/BEAR/NEUTRAL
+      sentiment = formatSentiment(sentiment);
       
       // Use existing data or defaults
       const enriched = {
@@ -777,7 +858,7 @@ router.get('/', async (req, res) => {
         otmLabel: otmLabel, // BUG #6 FIX: Always recalculated
         moneyness: moneynessData.label, // Use calculateMoneyness for consistency with REST API and filters
         moneynessColor: moneynessData.color,
-        sentiment: trade.sentiment || (trade.type === 'CALL' ? 'BULL' : 'BEAR'),
+        sentiment: sentiment, // FIX: Now correctly calculated based on buy/sell + option type
         side: trade.side || 'Mid', // BUG #4 FIX: Ensure side is present
         directionArrow: trade.directionArrow || (trade.type === 'CALL' ? '↑' : '↓'), // BUG #12 FIX
         tradeType: trade.tradeType || 'SPLIT', // BUG #7 & #8 FIX: Default to SPLIT, not NORMAL
@@ -1079,13 +1160,29 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
         }
         
         // Extract volume/OI from snapshot API data (snapshot API includes everything!)
-        // Snapshot API structure: contract.day.volume, contract.open_interest
-        const dayVolume = contract.day?.volume || contract.volume || contract.day_volume || 0;
-        const openInterest = contract.open_interest || contract.oi || contract.openInterest || 0;
+        // Check multiple possible field locations for volume
+        const dayVolume = contract.day?.volume || 
+                         contract.volume || 
+                         contract.day_volume || 
+                         contract.details?.day?.volume ||
+                         contract.details?.volume ||
+                         0;
+        
+        // Check multiple possible field locations for open interest
+        const openInterest = contract.open_interest || 
+                            contract.oi || 
+                            contract.openInterest ||
+                            contract.details?.open_interest ||
+                            contract.details?.oi ||
+                            0;
         
         // Debug logging for first few contracts to verify data extraction
         if (contracts.indexOf(contract) < 5) {
           console.log(`📊 Contract ${contracts.indexOf(contract) + 1}: ticker=${contract.ticker || contract.details?.ticker}, dayVolume=${dayVolume}, openInterest=${openInterest}`);
+          // Log available fields for debugging
+          if (dayVolume === 0 && openInterest === 0) {
+            console.log(`⚠️ No VOL/OI found. Available fields:`, Object.keys(contract).slice(0, 10));
+          }
         }
         
         // Get price from snapshot API data
@@ -1127,26 +1224,55 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
         const { side, sentiment, aggressor } = detectSide(avgPrice, bid, ask, normalizedType);
         
         // Calculate IV from snapshot API data (snapshot API includes IV!)
-        // Snapshot API structure: contract.implied_volatility (root level) or contract.greeks.mid_iv
+        // Check multiple possible field locations for IV
         let iv = 'N/A';
+        let ivValue = null;
+        
+        // Try all possible IV field locations
         if (contract.implied_volatility !== undefined && contract.implied_volatility !== null) {
-          iv = formatIV(contract.implied_volatility);
+          ivValue = contract.implied_volatility;
         } else if (contract.greeks?.mid_iv !== undefined && contract.greeks.mid_iv !== null) {
-          iv = formatIV(contract.greeks.mid_iv);
+          ivValue = contract.greeks.mid_iv;
         } else if (contract.greeks?.iv !== undefined && contract.greeks.iv !== null) {
-          iv = formatIV(contract.greeks.iv);
-        } else if (avgPrice > 0 && spotPrice > 0 && strike > 0) {
-          // Calculate IV if we have price data but no IV
+          ivValue = contract.greeks.iv;
+        } else if (contract.details?.implied_volatility !== undefined && contract.details.implied_volatility !== null) {
+          ivValue = contract.details.implied_volatility;
+        } else if (contract.details?.greeks?.mid_iv !== undefined && contract.details.greeks.mid_iv !== null) {
+          ivValue = contract.details.greeks.mid_iv;
+        } else if (contract.details?.greeks?.iv !== undefined && contract.details.greeks.iv !== null) {
+          ivValue = contract.details.greeks.iv;
+        }
+        
+        // Format IV if found
+        if (ivValue !== null && !isNaN(ivValue) && isFinite(ivValue)) {
+          iv = formatIV(ivValue);
+        } else if (avgPrice > 0 && spotPrice > 0 && strike > 0 && expDate) {
+          // Calculate IV if we have price data but no IV from API
           try {
             const T = (expDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24 * 365.25);
-            const r = 0.05;
+            const r = 0.05; // Risk-free rate
             const isCall = normalizedType === 'CALL';
-            if (T > 0 && avgPrice > 0) {
+            
+            // Validate inputs before calculation
+            if (T > 0 && T < 10 && avgPrice > 0 && spotPrice > 0 && strike > 0 && 
+                isFinite(T) && isFinite(avgPrice) && isFinite(spotPrice) && isFinite(strike)) {
               const calculatedIV = calculateImpliedVolatility(avgPrice, spotPrice, strike, T, r, isCall);
-              iv = formatIV(calculatedIV);
+              
+              // Validate calculated IV
+              if (calculatedIV && isFinite(calculatedIV) && calculatedIV > 0 && calculatedIV < 5) {
+                iv = formatIV(calculatedIV);
+              } else {
+                // Log invalid IV calculation for debugging (only first few)
+                if (contracts.indexOf(contract) < 3) {
+                  console.log(`⚠️ Invalid IV calculated: ${calculatedIV} for ${underlying} ${strike} ${normalizedType}`);
+                }
+              }
             }
           } catch (ivError) {
-            // Keep as N/A if calculation fails
+            // Log IV calculation errors for debugging (only first few)
+            if (contracts.indexOf(contract) < 3) {
+              console.log(`⚠️ IV calculation error for ${underlying} ${strike} ${normalizedType}:`, ivError.message);
+            }
           }
         }
         
@@ -1213,7 +1339,7 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
           otmLabel: otmLabel,
           moneyness: calculateMoneyness(spotPrice, strike, normalizedType).label,
           moneynessColor: calculateMoneyness(spotPrice, strike, normalizedType).color,
-          sentiment: sentiment.toUpperCase(),
+          sentiment: formatSentiment(sentiment), // FIX: Correctly converts Bullish/Bearish to BULL/BEAR
           side: detectSideWithColor(avgPrice, bid, ask).label,
           sideColor: detectSideWithColor(avgPrice, bid, ask).color,
           directionArrow: arrow,
@@ -1385,13 +1511,58 @@ async function buildTradesForTickerSearch(ticker) {
         premiumRaw: premium,
         volume: tradeSize,
         oi: openInterest,
-        iv: contract.implied_volatility ? formatIV(contract.implied_volatility) : (contract.greeks?.mid_iv ? formatIV(contract.greeks.mid_iv) : 'N/A'),
+        iv: (() => {
+          // Check multiple possible IV field locations
+          let ivValue = null;
+          if (contract.implied_volatility !== undefined && contract.implied_volatility !== null) {
+            ivValue = contract.implied_volatility;
+          } else if (contract.greeks?.mid_iv !== undefined && contract.greeks.mid_iv !== null) {
+            ivValue = contract.greeks.mid_iv;
+          } else if (contract.greeks?.iv !== undefined && contract.greeks.iv !== null) {
+            ivValue = contract.greeks.iv;
+          } else if (contract.details?.implied_volatility !== undefined && contract.details.implied_volatility !== null) {
+            ivValue = contract.details.implied_volatility;
+          } else if (contract.details?.greeks?.mid_iv !== undefined && contract.details.greeks.mid_iv !== null) {
+            ivValue = contract.details.greeks.mid_iv;
+          } else if (contract.details?.greeks?.iv !== undefined && contract.details.greeks.iv !== null) {
+            ivValue = contract.details.greeks.iv;
+          }
+          
+          // Format IV if found
+          if (ivValue !== null && !isNaN(ivValue) && isFinite(ivValue)) {
+            return formatIV(ivValue);
+          }
+          
+          // Calculate IV if we have price data but no IV from API
+          if (avgPrice > 0 && spotPrice > 0 && strike > 0 && expDate) {
+            try {
+              const T = (expDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24 * 365.25);
+              const r = 0.05;
+              const isCall = contractType === 'CALL';
+              
+              // Validate inputs before calculation
+              if (T > 0 && T < 10 && avgPrice > 0 && spotPrice > 0 && strike > 0 && 
+                  isFinite(T) && isFinite(avgPrice) && isFinite(spotPrice) && isFinite(strike)) {
+                const calculatedIV = calculateImpliedVolatility(avgPrice, spotPrice, strike, T, r, isCall);
+                
+                // Validate calculated IV
+                if (calculatedIV && isFinite(calculatedIV) && calculatedIV > 0 && calculatedIV < 5) {
+                  return formatIV(calculatedIV);
+                }
+              }
+            } catch (ivError) {
+              // Keep as N/A if calculation fails
+            }
+          }
+          
+          return 'N/A';
+        })(),
         dte: dte,
         otm: otm,
         otmLabel: otmLabel,
         moneyness: calculateMoneyness(spotPrice, strike, contractType).label,
         moneynessColor: calculateMoneyness(spotPrice, strike, contractType).color,
-        sentiment: sentiment.toUpperCase(),
+        sentiment: formatSentiment(sentiment), // FIX: Correctly converts Bullish/Bearish to BULL/BEAR
         side: detectSideWithColor(avgPrice, bid, ask).label,
         sideColor: detectSideWithColor(avgPrice, bid, ask).color,
         directionArrow: getDirectionArrow(contractType, side).arrow,
@@ -1579,6 +1750,19 @@ function calculateMoneyness(spot, strike, type) {
 }
 
 // Enhanced detectSide to return label and color
+/**
+ * Convert sentiment from detectSide format to frontend format
+ * 'Bullish' -> 'BULL', 'Bearish' -> 'BEAR', 'Neutral' -> 'NEUTRAL'
+ */
+function formatSentiment(sentiment) {
+  if (!sentiment) return 'NEUTRAL';
+  const upper = sentiment.toUpperCase();
+  if (upper === 'BULLISH' || upper === 'BULL') return 'BULL';
+  if (upper === 'BEARISH' || upper === 'BEAR') return 'BEAR';
+  if (upper === 'NEUTRAL') return 'NEUTRAL';
+  return 'NEUTRAL'; // Default fallback
+}
+
 function detectSideWithColor(tradePrice, bid, ask) {
   // If no bid/ask data
   if (!bid || !ask || bid === 0 || ask === 0) {
