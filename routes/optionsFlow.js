@@ -63,7 +63,7 @@ function initPolygonWebSocket() {
           isConnected = true;
           
           // Subscribe to options trades for major tickers
-          const tickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD'];
+          const tickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD', 'SPX', 'SPXW', 'XSP', 'NDX'];
           const subscriptions = tickers.map(ticker => `O.${ticker}*`).join(',');
           
           ws.send(JSON.stringify({
@@ -161,6 +161,9 @@ async function processOptionsTrade(trade) {
     // BUG #6 FIX: Calculate OTM percentage correctly
     const { otmPercent, otmLabel } = calculateOTM(strike, spotPrice, type);
     const otm = `${otmPercent.toFixed(1)}%`;
+    
+    // Calculate moneyness using the same function as REST API (consistent with filter logic)
+    const moneynessData = calculateMoneyness(spotPrice, strike, type);
 
     // BUG #7 & #8 FIX: Classify trade type correctly
     const tradeTypeObj = {
@@ -212,7 +215,8 @@ async function processOptionsTrade(trade) {
       tradeType: tradeType.toUpperCase(), // BUG #7 & #8 FIX: Now correctly classified
       confidence: setupScoreData.score, // BUG #15 FIX: Now calculated correctly
       isHighProbability: setupScoreData.isHighProbability, // BUG #15 FIX
-      moneyness: otmLabel, // Use OTM label
+      moneyness: moneynessData.label, // Use calculateMoneyness for consistency with REST API and filters
+      moneynessColor: moneynessData.color,
       exchange: x,
       conditions: c,
       rawSymbol: sym,
@@ -346,6 +350,7 @@ router.get('/', async (req, res) => {
       belowBid,
       itm,
       otm,
+      atm,
       volGtOi,
       shortExpiry,
       leaps,
@@ -567,9 +572,16 @@ router.get('/', async (req, res) => {
         // If tradeType parameter is set, use it
         if (tradeTypeFilter && trade.tradeType !== tradeTypeFilter) return false;
         
-        // ITM/OTM filters - use helper function to check if filter is active
-        if (isFilterActive(itm) && trade.moneyness !== 'ITM') return false;
-        if (isFilterActive(otm) && trade.moneyness !== 'OTM') return false;
+        // ITM/OTM/ATM filters - mutually exclusive (if any is active, trade must match that one)
+        const atm = req.query.atm;
+        const hasMoneynessFilter = isFilterActive(itm) || isFilterActive(otm) || isFilterActive(atm);
+        if (hasMoneynessFilter) {
+          // If any moneyness filter is active, trade must match at least one active filter
+          const matchesItm = isFilterActive(itm) && trade.moneyness === 'ITM';
+          const matchesOtm = isFilterActive(otm) && trade.moneyness === 'OTM';
+          const matchesAtm = isFilterActive(atm) && trade.moneyness === 'ATM';
+          if (!matchesItm && !matchesOtm && !matchesAtm) return false;
+        }
         
         // Volume > OI filter - use helper function to check if filter is active
         if (isFilterActive(volGtOi) && trade.volume <= trade.oi) return false;
@@ -729,6 +741,9 @@ router.get('/', async (req, res) => {
       const otm = `${otmCalc.otmPercent.toFixed(1)}%`;
       const otmLabel = otmCalc.otmLabel;
       
+      // Calculate moneyness using the same function as REST API (consistent with filter logic)
+      const moneynessData = calculateMoneyness(spotPrice, trade.strike, trade.type);
+      
       // BUG #5 FIX: Validate and fix IV if it's too high
       let iv = trade.iv || 'N/A';
       if (iv !== 'N/A') {
@@ -760,7 +775,8 @@ router.get('/', async (req, res) => {
         dte: trade.dte || (trade.expirationDate ? calculateDTE(new Date(trade.expirationDate)) : 'N/A'),
         otm: otm, // BUG #6 FIX: Always recalculated with actual spot price
         otmLabel: otmLabel, // BUG #6 FIX: Always recalculated
-        moneyness: otmLabel, // Use recalculated OTM label
+        moneyness: moneynessData.label, // Use calculateMoneyness for consistency with REST API and filters
+        moneynessColor: moneynessData.color,
         sentiment: trade.sentiment || (trade.type === 'CALL' ? 'BULL' : 'BEAR'),
         side: trade.side || 'Mid', // BUG #4 FIX: Ensure side is present
         directionArrow: trade.directionArrow || (trade.type === 'CALL' ? '↑' : '↓'), // BUG #12 FIX
@@ -875,7 +891,7 @@ async function fetchAllContracts(apiKey) {
     console.log('📡 fetchAllContracts() started - using snapshot API for efficient fetching...');
     
     // Major tickers to fetch options for
-    const tickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD', 'A', 'IWM', 'DIA', 'TLT'];
+    const tickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD', 'A', 'IWM', 'DIA', 'TLT', 'SPX', 'SPXW', 'XSP', 'NDX'];
     
     // Adjust limits based on store size - fetch more when store is already populated
     const contractsPerTicker = tradesStore.size > 10000 ? 500 : 200; // Fetch more contracts per ticker if store is populated
@@ -1195,10 +1211,13 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
           dte: dte,
           otm: otm,
           otmLabel: otmLabel,
-          moneyness: otmLabel,
+          moneyness: calculateMoneyness(spotPrice, strike, normalizedType).label,
+          moneynessColor: calculateMoneyness(spotPrice, strike, normalizedType).color,
           sentiment: sentiment.toUpperCase(),
-          side: side,
+          side: detectSideWithColor(avgPrice, bid, ask).label,
+          sideColor: detectSideWithColor(avgPrice, bid, ask).color,
           directionArrow: arrow,
+          spotRaw: spotPrice,
           tradeType: tradeType.toUpperCase(),
           confidence: setupScoreData.score,
           isHighProbability: setupScoreData.isHighProbability,
@@ -1370,10 +1389,13 @@ async function buildTradesForTickerSearch(ticker) {
         dte: dte,
         otm: otm,
         otmLabel: otmLabel,
-        moneyness: otmLabel,
+        moneyness: calculateMoneyness(spotPrice, strike, contractType).label,
+        moneynessColor: calculateMoneyness(spotPrice, strike, contractType).color,
         sentiment: sentiment.toUpperCase(),
-        side,
+        side: detectSideWithColor(avgPrice, bid, ask).label,
+        sideColor: detectSideWithColor(avgPrice, bid, ask).color,
         directionArrow: getDirectionArrow(contractType, side).arrow,
+        spotRaw: spotPrice,
         tradeType: tradeType.toUpperCase(),
         confidence: calculateSetupScore({
           volume: tradeSize,
@@ -1528,9 +1550,77 @@ function formatExpiration(dateStr) {
 // BUG #6 FIX: calculateOTM is now imported from utils/optionsCalculations.js
 // This function is kept for backward compatibility but uses the imported version
 
-function calculateMoneyness(ticker, strike, type) {
-  // This would need current price - simplified for now
-  return 'OTM'; // or 'ITM' or 'ATM'
+// Calculate moneyness (ITM/ATM/OTM) with color
+function calculateMoneyness(spot, strike, type) {
+  if (!spot || !strike) return { label: 'OTM', color: '#EF4444' };
+  
+  const percentDiff = ((strike - spot) / spot) * 100;
+  
+  // ATM = within 1% of spot price
+  if (Math.abs(percentDiff) <= 1) {
+    return { label: 'ATM', color: '#FBBF24' }; // Yellow
+  }
+  
+  // For CALLS: ITM if strike < spot, OTM if strike > spot
+  // For PUTS: ITM if strike > spot, OTM if strike < spot
+  if (type === 'CALL' || type === 'C') {
+    if (strike < spot) {
+      return { label: 'ITM', color: '#22C55E' }; // Green
+    } else {
+      return { label: 'OTM', color: '#EF4444' }; // Red
+    }
+  } else { // PUT
+    if (strike > spot) {
+      return { label: 'ITM', color: '#22C55E' }; // Green
+    } else {
+      return { label: 'OTM', color: '#EF4444' }; // Red
+    }
+  }
+}
+
+// Enhanced detectSide to return label and color
+function detectSideWithColor(tradePrice, bid, ask) {
+  // If no bid/ask data
+  if (!bid || !ask || bid === 0 || ask === 0) {
+    return { label: 'Mid', color: '#6B7280' }; // Gray
+  }
+  
+  const mid = (bid + ask) / 2;
+  const spread = ask - bid;
+  const threshold = spread * 0.1; // 10% of spread
+  
+  // Above Ask - VERY aggressive buy
+  if (tradePrice > ask) {
+    return { label: 'Abv Ask', color: '#22C55E' }; // Bright green
+  }
+  
+  // At Ask - Aggressive buy
+  if (tradePrice >= ask - threshold) {
+    return { label: 'At Ask', color: '#4ADE80' }; // Green
+  }
+  
+  // To Ask - Leaning buy
+  if (tradePrice > mid) {
+    return { label: 'To Ask', color: '#86EFAC' }; // Light green
+  }
+  
+  // Below Bid - VERY aggressive sell
+  if (tradePrice < bid) {
+    return { label: 'Blw Bid', color: '#EF4444' }; // Bright red
+  }
+  
+  // At Bid - Aggressive sell
+  if (tradePrice <= bid + threshold) {
+    return { label: 'At Bid', color: '#F87171' }; // Red
+  }
+  
+  // To Bid - Leaning sell
+  if (tradePrice < mid) {
+    return { label: 'To Bid', color: '#FCA5A5' }; // Light red
+  }
+  
+  // Exactly at mid
+  return { label: 'Mid', color: '#6B7280' }; // Gray
 }
 
 // BUG #7 & #8 FIX: classifyTradeType is now imported from utils/optionsCalculations.js
