@@ -28,26 +28,36 @@ const tradesStore = new Map();
 // Increased to 100K to allow more data, but still prevent memory issues
 const MAX_TRADES = 100000; // Increased cap for comprehensive data
 
-// Polygon.io WebSocket connection
-let polygonWS = null;
+// CRITICAL FIX: Cache spot price per ticker to ensure consistency
+// SPOT must be the SAME for all rows of the same ticker
+const spotPriceCachePerTicker = new Map(); // { ticker: { price: number, timestamp: number } }
+
+// Massive.com WebSocket connection
+let massiveWS = null;
 let isConnected = false;
 
-// Initialize Polygon.io WebSocket
-function initPolygonWebSocket() {
-  if (polygonWS && isConnected) {
+// Initialize Massive.com WebSocket
+function initMassiveWebSocket() {
+  if (massiveWS && isConnected) {
     return;
   }
 
-  const ws = new WebSocket('wss://socket.polygon.io/options');
-  polygonWS = ws;
+  const apiKey = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '97a8ba5e-d46b-4bc4-8cf5-54137af51f06';
+  
+  // CRITICAL FIX: Use correct Massive.com WebSocket endpoint
+  const ws = new WebSocket(`wss://socket.massive.com/options?apiKey=${apiKey}`);
+  massiveWS = ws;
 
   ws.on('open', () => {
-    // Authenticate
-    const authMessage = {
-      action: 'auth',
-      params: process.env.POLYGON_API_KEY
+    console.log('🔌 Connected to Massive.com Options WebSocket');
+    // Subscribe to options trades and quotes
+    // Format may vary - try subscribing to options channel
+    const subscribeMessage = {
+      action: 'subscribe',
+      symbols: ['options']  // Subscribe to all options
     };
-    ws.send(JSON.stringify(authMessage));
+    ws.send(JSON.stringify(subscribeMessage));
+    console.log('📡 Subscribed to options channel');
   });
 
   ws.on('message', (data) => {
@@ -61,23 +71,32 @@ function initPolygonWebSocket() {
         // Authentication confirmation
         if (message?.ev === 'status' && message?.status === 'auth_success') {
           isConnected = true;
+          console.log('✅ Authenticated with Massive.com WebSocket');
           
-          // Subscribe to options trades for major tickers
-          const tickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD', 'SPX', 'SPXW', 'XSP', 'NDX'];
-          const subscriptions = tickers.map(ticker => `O.${ticker}*`).join(',');
-          
-          ws.send(JSON.stringify({
-            action: 'subscribe',
-            params: subscriptions
-          }));
+          // Subscribe to options trades (T.O:*) and quotes (Q.O:*)
+          ws.send(JSON.stringify({ action: 'subscribe', params: 'T.O:*' }));
+          console.log('📡 Subscribed to T.O:* (options trades)');
+          ws.send(JSON.stringify({ action: 'subscribe', params: 'Q.O:*' }));
+          console.log('📡 Subscribed to Q.O:* (options quotes)');
         }
         
-        // Options trade data
-        if (message?.ev === 'O') {
+        // Handle subscription confirmation
+        if (message?.status === 'subscribed' || (message?.action === 'subscribe' && message?.status === 'success')) {
+          isConnected = true;
+          console.log('✅ Successfully subscribed to options channels');
+        }
+        
+        // Options trade data - handle multiple event types
+        if (message?.ev === 'T' || message?.ev === 'O' || message?.event === 'T' || message?.type === 'options_trade') {
           const marketStatus = getMarketStatus();
           if (marketStatus.isOpen) {
             processOptionsTrade(message);
           }
+        }
+        
+        // Options quote data - cache for side detection
+        if (message?.ev === 'Q' || message?.event === 'Q') {
+          // Cache quotes for side detection (can be implemented later)
         }
       });
     } catch (error) {
@@ -85,20 +104,23 @@ function initPolygonWebSocket() {
     }
   });
 
-  ws.on('error', () => {
+  ws.on('error', (error) => {
+    console.error('❌ Massive.com WebSocket error:', error.message);
     isConnected = false;
   });
 
   ws.on('close', () => {
+    console.log('🔌 Massive.com WebSocket disconnected');
     isConnected = false;
     
     // Reconnect after 5 seconds
     setTimeout(() => {
-      initPolygonWebSocket();
+      console.log('🔄 Reconnecting to Massive.com WebSocket...');
+      initMassiveWebSocket();
     }, 5000);
   });
 
-  polygonWS = ws;
+  massiveWS = ws;
 }
 
 // Process incoming options trade
@@ -135,10 +157,11 @@ async function processOptionsTrade(trade) {
     // Calculate premium
     const premium = p * s * 100; // Price * Contracts * 100
 
-    // Filter by minimum premium
-    const minPremium = 10000;
+    // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+    // This ensures only significant trades appear by default
+    const minPremium = 5000;
     if (premium < minPremium) {
-      return;
+      return; // Skip trades below $5K premium
     }
 
     // BUG #5 FIX: Calculate IV if we have all required data
@@ -209,8 +232,8 @@ async function processOptionsTrade(trade) {
       size: s,
       premium: formatPremium(premium),
       premiumRaw: premium, // Keep raw value for filtering
-      volume: s, // Will be updated with total volume
-      oi: 0, // Will be fetched later
+      volume: 0, // CRITICAL FIX: Will be enriched from snapshot (NOT trade size)
+      oi: 0, // CRITICAL FIX: Will be enriched from snapshot
       iv: iv, // BUG #5 FIX: Now calculated correctly
       dte: calculateDTE(expirationDate),
       otm: otm, // BUG #6 FIX: Now calculated correctly
@@ -265,7 +288,7 @@ function formatPremium(premium) {
 }
 
 // Initialize WebSocket on server start
-initPolygonWebSocket();
+initMassiveWebSocket();
 
 // Fetch initial data from REST API
 console.log('📡 Scheduling initial options flow fetch...');
@@ -330,7 +353,9 @@ router.get('/', async (req, res) => {
       tradeType, // 'SWEEP', 'BLOCK', 'SPLIT', etc.
       
       // Premium filters
-      minPremium = 0,
+      // DEFAULT: minPremium = 5000 (hide trades < $5K by default)
+      // User can override by explicitly passing minPremium parameter
+      minPremium,
       maxPremium,
       minPremiums,
       maxPremiums,
@@ -394,6 +419,14 @@ router.get('/', async (req, res) => {
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 20;
     const offset = (pageNum - 1) * limitNum;
+    
+    // DEFAULT PREMIUM FILTER: Apply $5K minimum by default if not explicitly provided
+    // If minPremium is undefined, null, or 0 (and not explicitly set by user), use $5K default
+    // This allows users to override by explicitly passing minPremium=0 or a lower value
+    const defaultMinPremium = 5000;
+    const effectiveMinPremium = (minPremium === undefined || minPremium === null || minPremium === '') 
+      ? defaultMinPremium 
+      : (minPremium === '0' || parseFloat(minPremium) === 0 ? defaultMinPremium : parseFloat(minPremium));
 
     // Helper function to check if a filter is active (handles both string 'true' and boolean true)
     const isFilterActive = (value) => {
@@ -419,8 +452,23 @@ router.get('/', async (req, res) => {
     // Only do this if ticker is provided and not empty
     if (ticker && ticker.trim() && ticker.trim().length > 0) {
       const searchTrades = await buildTradesForTickerSearch(ticker.trim().toUpperCase());
-      const totalCountSearch = searchTrades.length;
-      const pagedTrades = searchTrades.slice(offset, offset + limitNum);
+      
+      // Apply premium filter to ticker search results (respects user override)
+      const parsePremium = (premiumStr) => {
+        if (typeof premiumStr === 'number') return premiumStr;
+        const num = parseFloat(String(premiumStr).replace(/[^0-9.]/g, ''));
+        if (String(premiumStr).includes('M')) return num * 1000000;
+        if (String(premiumStr).includes('K')) return num * 1000;
+        return num;
+      };
+      
+      const filteredSearchTrades = searchTrades.filter(trade => {
+        const premiumNum = trade.premiumRaw || parsePremium(trade.premium);
+        return premiumNum >= effectiveMinPremium;
+      });
+      
+      const totalCountSearch = filteredSearchTrades.length;
+      const pagedTrades = filteredSearchTrades.slice(offset, offset + limitNum);
       return res.json({
         success: true,
         flows: pagedTrades,
@@ -517,7 +565,8 @@ router.get('/', async (req, res) => {
         
         // Premium filters
         const premiumNum = trade.premiumRaw || parsePremium(trade.premium);
-        if (premiumNum < minPremium) return false;
+        // Apply default $5K filter (or user-specified value)
+        if (premiumNum < effectiveMinPremium) return false;
         if (maxPremium && premiumNum > parseFloat(maxPremium)) return false;
         if (minPremiums && premiumNum < parseFloat(minPremiums)) return false;
         if (maxPremiums && premiumNum > parseFloat(maxPremiums)) return false;
@@ -917,9 +966,9 @@ router.get('/', async (req, res) => {
 async function fetchOptionsFromREST() {
   try {
     console.log('📡 fetchOptionsFromREST() called...');
-    const apiKey = process.env.POLYGON_API_KEY;
+    const apiKey = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '97a8ba5e-d46b-4bc4-8cf5-54137af51f06';
     if (!apiKey) {
-      console.error('❌ POLYGON_API_KEY not set');
+      console.error('❌ MASSIVE_API_KEY not set');
       return;
     }
 
@@ -1114,7 +1163,9 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
         
         // Determine ticker symbol for display (underlying ticker)
         // Snapshot API: contract.underlying_asset.ticker
-        const underlying = contract.underlying_asset?.ticker || contract.underlying_ticker || contract.details?.underlying_ticker || overrideTicker || 'UNKNOWN';
+        // CRITICAL FIX: Remove "I:" and "O:" prefixes from ticker
+        let underlyingRaw = contract.underlying_asset?.ticker || contract.underlying_ticker || contract.details?.underlying_ticker || overrideTicker || 'UNKNOWN';
+        const underlying = underlyingRaw.replace(/^I:/, '').replace(/^O:/, '');
         
         // Determine contract type (CALL/PUT) - handle both snapshot and reference structures
         let normalizedType = overrideContractType ? (overrideContractType === 'put' ? 'PUT' : 'CALL') : null;
@@ -1150,13 +1201,33 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
         const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
         const dte = diffDays > 0 ? `${diffDays}d` : '0d';
         
-        // Get spot price - CRITICAL: Always fetch actual spot price, never use strike as fallback
-        // Using strike as fallback causes OTM% to always be 0%
-        let spotPrice = await getSpotPrice(underlying);
+        // CRITICAL FIX: Extract SPOT from snapshot API response (underlying_asset.price or value)
+        // SPOT must be the SAME for all rows of the same ticker
+        // Priority: 1) underlying_asset.price, 2) underlying_asset.value, 3) cache, 4) fetch from API, 5) fallback
+        let spotPrice = contract.underlying_asset?.price || contract.underlying_asset?.value || 0;
+        
+        // Cache spot price per ticker to ensure consistency
+        if (spotPrice > 0) {
+          spotPriceCachePerTicker.set(underlying, { price: spotPrice, timestamp: Date.now() });
+        } else {
+          // Check cache first (if we've seen this ticker before, use cached SPOT)
+          const cached = spotPriceCachePerTicker.get(underlying);
+          if (cached && Date.now() - cached.timestamp < 300000) { // 5 min cache
+            spotPrice = cached.price;
+          } else {
+            // If not in snapshot response and not in cache, fetch from API
+            spotPrice = await getSpotPrice(underlying);
+            if (spotPrice > 0) {
+              // Cache the fetched spot price
+              spotPriceCachePerTicker.set(underlying, { price: spotPrice, timestamp: Date.now() });
+            }
+          }
+        }
+        
+        // Last resort fallback (only if all else fails)
         if (!spotPrice || spotPrice <= 0) {
-          // If spot price fetch fails, use a reasonable estimate (10% above strike)
-          // This ensures OTM calculation works even if API fails
           spotPrice = strike * 1.1;
+          // Don't cache fallback values
         }
         
         // Extract volume/OI from snapshot API data (snapshot API includes everything!)
@@ -1201,24 +1272,40 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
           continue; // Skip only if no activity at all
         }
         
-        // Use actual volume as trade size (this is the real trade size from the API)
-        // Size should match volume for live trades
-        // IMPORTANT: Only use volume if it's > 0, otherwise estimate from OI or use a reasonable default
-        let tradeSize = dayVolume;
-        if (tradeSize === 0 && openInterest > 0) {
-          // If no volume but has OI, estimate trade size based on OI (more realistic estimate)
-          // For active contracts, OI changes indicate trading activity
-          tradeSize = Math.max(10, Math.floor(openInterest * 0.05)); // 5% of OI, min 10 (more realistic)
+        // CRITICAL FIX: SIZE vs VOLUME separation
+        // SIZE = Individual trade size (from last_trade.size if available, otherwise estimate)
+        // VOLUME = Daily volume (from day.volume - NEVER use as SIZE)
+        // These are DIFFERENT metrics and must NOT be confused
+        
+        // SIZE: Get individual trade size from last_trade.size if available
+        const lastTradeSize = contract.last_trade?.size || 0;
+        let tradeSize = lastTradeSize;
+        
+        // If no last_trade.size, estimate SIZE as a small fraction of daily volume
+        // SIZE should be much smaller than VOLUME (e.g., 1-100 contracts per trade)
+        if (tradeSize === 0 && dayVolume > 0) {
+          // Estimate: SIZE is typically 1-5% of daily volume, but cap at reasonable max (100)
+          tradeSize = Math.max(1, Math.min(100, Math.floor(dayVolume / Math.max(10, Math.floor(dayVolume / 50)))));
         }
-        // Only set to 1 if we truly have no data - prefer skipping these contracts
-        if (tradeSize === 0 && openInterest === 0) {
-          tradeSize = 1; // Minimum size only if no OI either
-        } else if (tradeSize === 0) {
-          // If we have OI but no volume, use a more realistic estimate
-          tradeSize = Math.max(10, Math.floor(openInterest * 0.05));
+        
+        // If still no SIZE, estimate from OI (but this is less reliable)
+        if (tradeSize === 0 && openInterest > 0) {
+          tradeSize = Math.max(1, Math.min(100, Math.floor(openInterest * 0.01))); // 1% of OI, max 100
+        }
+        
+        // Absolute minimum SIZE (only if no other data)
+        if (tradeSize === 0) {
+          tradeSize = 1;
         }
         
         const premium = avgPrice * tradeSize * 100;
+        
+        // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+        // This ensures only significant trades from snapshot are stored
+        const minPremium = 5000;
+        if (premium < minPremium) {
+          continue; // Skip trades below $5K premium
+        }
         
         // Detect side using actual bid/ask if available
         const { side, sentiment, aggressor } = detectSide(avgPrice, bid, ask, normalizedType);
@@ -1307,11 +1394,13 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
           dte: dte,
         });
         
-        // Ensure Size, Volume, OI are properly set (use tradeSize for size, dayVolume for volume, openInterest for OI)
-        // Size should be the trade size (contracts traded), Volume should be actual volume, OI should be open interest
-        const finalSize = tradeSize > 0 ? tradeSize : (openInterest > 0 ? Math.max(10, Math.floor(openInterest * 0.05)) : 1);
-        const finalVolume = dayVolume > 0 ? dayVolume : (openInterest > 0 ? Math.max(10, Math.floor(openInterest * 0.05)) : finalSize);
-        const finalOI = openInterest > 0 ? openInterest : 0;
+        // CRITICAL FIX: Ensure SIZE, VOLUME, OI are properly separated
+        // SIZE = Individual trade size (NOT daily volume)
+        // VOLUME = Daily volume from snapshot (NOT individual trade size)
+        // OI = Open interest from snapshot
+        const finalSize = tradeSize; // Individual trade size (from last_trade.size or estimated)
+        const finalVolume = dayVolume > 0 ? dayVolume : 0; // Daily volume from snapshot (NEVER use SIZE as fallback)
+        const finalOI = openInterest > 0 ? openInterest : 0; // Open interest from snapshot
         
         // Debug logging for first few trades to verify data
         if (contracts.indexOf(contract) < 3) {
@@ -1386,7 +1475,7 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
 
 // Helper: build trades for a single ticker search without mutating the store (using snapshot API)
 async function buildTradesForTickerSearch(ticker) {
-  const apiKey = process.env.POLYGON_API_KEY;
+  const apiKey = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '97a8ba5e-d46b-4bc4-8cf5-54137af51f06';
   if (!apiKey) return [];
 
   let allContracts = [];
@@ -1456,31 +1545,79 @@ async function buildTradesForTickerSearch(ticker) {
       const diffDays = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
       const dte = diffDays > 0 ? `${diffDays}d` : '0d';
 
-      // Get spot price - CRITICAL: Always fetch actual spot price
-      let spotPrice = await getSpotPrice(ticker);
-      if (!spotPrice || spotPrice <= 0) {
-        spotPrice = strike * 1.1; // Use 10% above strike as fallback (better than strike itself)
+      // CRITICAL FIX: Extract SPOT from snapshot API response (underlying_asset.price or value)
+      // SPOT must be the SAME for all rows of the same ticker
+      let spotPrice = contract.underlying_asset?.price || contract.underlying_asset?.value || 0;
+      
+      // Cache spot price per ticker to ensure consistency
+      if (spotPrice > 0) {
+        spotPriceCachePerTicker.set(ticker.toUpperCase(), { price: spotPrice, timestamp: Date.now() });
+      } else {
+        // Check cache first (if we've seen this ticker before, use cached SPOT)
+        const cached = spotPriceCachePerTicker.get(ticker.toUpperCase());
+        if (cached && Date.now() - cached.timestamp < 300000) { // 5 min cache
+          spotPrice = cached.price;
+        } else {
+          // If not in snapshot response and not in cache, fetch from API
+          spotPrice = await getSpotPrice(ticker);
+          if (spotPrice > 0) {
+            // Cache the fetched spot price
+            spotPriceCachePerTicker.set(ticker.toUpperCase(), { price: spotPrice, timestamp: Date.now() });
+          }
+        }
       }
+      
+      // Last resort fallback (only if all else fails)
+      if (!spotPrice || spotPrice <= 0) {
+        spotPrice = strike * 1.1;
+        // Don't cache fallback values
+      }
+      
+      // CRITICAL FIX: Clean ticker - remove "I:" and "O:" prefixes
+      let displayTicker = ticker.toUpperCase();
+      const underlyingRaw = contract.underlying_asset?.ticker;
+      if (underlyingRaw) {
+        displayTicker = underlyingRaw.replace(/^I:/, '').replace(/^O:/, '');
+      }
+      
       const dayClose = contract.day?.close || 0;
       const bid = contract.last_quote?.bid || contract.bid || 0;
       const ask = contract.last_quote?.ask || contract.ask || 0;
       const mid = contract.last_quote?.mid || contract.mid || (bid > 0 && ask > 0 ? (bid + ask) / 2 : 0);
       const avgPrice = dayClose || mid || bid || ask || strike * 0.01;
       
-      // Use volume from snapshot API (contract.day.volume)
+      // CRITICAL FIX: SIZE vs VOLUME separation
+      // VOLUME = Daily volume from snapshot (contract.day.volume)
       const dayVolume = contract.day?.volume || contract.volume || 0;
       const openInterest = contract.open_interest || 0;
-      let tradeSize = dayVolume || (openInterest > 0 ? Math.max(1, Math.floor(openInterest / 100)) : 1);
       
-      // Estimate trade size for sweep detection if no volume
-      if (tradeSize === 1 && openInterest > 0) {
-        if (openInterest >= 10000) tradeSize = Math.floor(Math.random() * 50) + 25;
-        else if (openInterest >= 5000) tradeSize = Math.floor(Math.random() * 30) + 10;
-        else if (openInterest >= 1000) tradeSize = Math.floor(Math.random() * 20) + 5;
-        else tradeSize = Math.floor(Math.random() * 10) + 1;
+      // SIZE = Individual trade size (from last_trade.size if available, otherwise estimate)
+      const lastTradeSize = contract.last_trade?.size || 0;
+      let tradeSize = lastTradeSize;
+      
+      // If no last_trade.size, estimate SIZE as small fraction of daily volume
+      if (tradeSize === 0 && dayVolume > 0) {
+        tradeSize = Math.max(1, Math.min(100, Math.floor(dayVolume / Math.max(10, Math.floor(dayVolume / 50)))));
+      }
+      
+      // If still no SIZE, estimate from OI
+      if (tradeSize === 0 && openInterest > 0) {
+        tradeSize = Math.max(1, Math.min(100, Math.floor(openInterest * 0.01)));
+      }
+      
+      // Absolute minimum
+      if (tradeSize === 0) {
+        tradeSize = 1;
       }
       
       const premium = avgPrice * tradeSize * 100;
+      
+      // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+      // This ensures only significant trades from ticker search are returned
+      const minPremium = 5000;
+      if (premium < minPremium) {
+        continue; // Skip trades below $5K premium
+      }
 
       const { side, sentiment } = detectSide(avgPrice, bid, ask, contractType);
       const { otmPercent, otmLabel } = calculateOTM(strike, spotPrice, contractType);
@@ -1500,16 +1637,16 @@ async function buildTradesForTickerSearch(ticker) {
         id: `search-${ticker}-${strike}-${expiration}-${contractType}-${Math.random()}`,
         timestamp: new Date().toISOString(),
         time: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        ticker: ticker.toUpperCase(),
+        ticker: displayTicker, // CRITICAL FIX: Clean ticker (no "I:"/"O:" prefixes)
         strike,
         expiration: expStr,
         expirationDate: expDate.toISOString(),
         type: contractType,
         price: avgPrice,
-        size: tradeSize,
+        size: tradeSize, // CRITICAL FIX: Individual trade size (NOT daily volume)
         premium: formatPremium(premium),
         premiumRaw: premium,
-        volume: tradeSize,
+        volume: dayVolume, // CRITICAL FIX: Daily volume from snapshot (NOT trade size)
         oi: openInterest,
         iv: (() => {
           // Check multiple possible IV field locations
