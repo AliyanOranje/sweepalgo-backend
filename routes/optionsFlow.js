@@ -157,10 +157,11 @@ async function processOptionsTrade(trade) {
     // Calculate premium
     const premium = p * s * 100; // Price * Contracts * 100
 
-    // Filter by minimum premium
-    const minPremium = 10000;
+    // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+    // This ensures only significant trades appear by default
+    const minPremium = 5000;
     if (premium < minPremium) {
-      return;
+      return; // Skip trades below $5K premium
     }
 
     // BUG #5 FIX: Calculate IV if we have all required data
@@ -352,7 +353,9 @@ router.get('/', async (req, res) => {
       tradeType, // 'SWEEP', 'BLOCK', 'SPLIT', etc.
       
       // Premium filters
-      minPremium = 0,
+      // DEFAULT: minPremium = 5000 (hide trades < $5K by default)
+      // User can override by explicitly passing minPremium parameter
+      minPremium,
       maxPremium,
       minPremiums,
       maxPremiums,
@@ -416,6 +419,14 @@ router.get('/', async (req, res) => {
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 20;
     const offset = (pageNum - 1) * limitNum;
+    
+    // DEFAULT PREMIUM FILTER: Apply $5K minimum by default if not explicitly provided
+    // If minPremium is undefined, null, or 0 (and not explicitly set by user), use $5K default
+    // This allows users to override by explicitly passing minPremium=0 or a lower value
+    const defaultMinPremium = 5000;
+    const effectiveMinPremium = (minPremium === undefined || minPremium === null || minPremium === '') 
+      ? defaultMinPremium 
+      : (minPremium === '0' || parseFloat(minPremium) === 0 ? defaultMinPremium : parseFloat(minPremium));
 
     // Helper function to check if a filter is active (handles both string 'true' and boolean true)
     const isFilterActive = (value) => {
@@ -441,8 +452,23 @@ router.get('/', async (req, res) => {
     // Only do this if ticker is provided and not empty
     if (ticker && ticker.trim() && ticker.trim().length > 0) {
       const searchTrades = await buildTradesForTickerSearch(ticker.trim().toUpperCase());
-      const totalCountSearch = searchTrades.length;
-      const pagedTrades = searchTrades.slice(offset, offset + limitNum);
+      
+      // Apply premium filter to ticker search results (respects user override)
+      const parsePremium = (premiumStr) => {
+        if (typeof premiumStr === 'number') return premiumStr;
+        const num = parseFloat(String(premiumStr).replace(/[^0-9.]/g, ''));
+        if (String(premiumStr).includes('M')) return num * 1000000;
+        if (String(premiumStr).includes('K')) return num * 1000;
+        return num;
+      };
+      
+      const filteredSearchTrades = searchTrades.filter(trade => {
+        const premiumNum = trade.premiumRaw || parsePremium(trade.premium);
+        return premiumNum >= effectiveMinPremium;
+      });
+      
+      const totalCountSearch = filteredSearchTrades.length;
+      const pagedTrades = filteredSearchTrades.slice(offset, offset + limitNum);
       return res.json({
         success: true,
         flows: pagedTrades,
@@ -539,7 +565,8 @@ router.get('/', async (req, res) => {
         
         // Premium filters
         const premiumNum = trade.premiumRaw || parsePremium(trade.premium);
-        if (premiumNum < minPremium) return false;
+        // Apply default $5K filter (or user-specified value)
+        if (premiumNum < effectiveMinPremium) return false;
         if (maxPremium && premiumNum > parseFloat(maxPremium)) return false;
         if (minPremiums && premiumNum < parseFloat(minPremiums)) return false;
         if (maxPremiums && premiumNum > parseFloat(maxPremiums)) return false;
@@ -1273,6 +1300,13 @@ async function processContracts(contracts, overrideTicker = null, overrideContra
         
         const premium = avgPrice * tradeSize * 100;
         
+        // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+        // This ensures only significant trades from snapshot are stored
+        const minPremium = 5000;
+        if (premium < minPremium) {
+          continue; // Skip trades below $5K premium
+        }
+        
         // Detect side using actual bid/ask if available
         const { side, sentiment, aggressor } = detectSide(avgPrice, bid, ask, normalizedType);
         
@@ -1577,6 +1611,13 @@ async function buildTradesForTickerSearch(ticker) {
       }
       
       const premium = avgPrice * tradeSize * 100;
+      
+      // DEFAULT PREMIUM FILTER: Hide trades with premium < $5,000
+      // This ensures only significant trades from ticker search are returned
+      const minPremium = 5000;
+      if (premium < minPremium) {
+        continue; // Skip trades below $5K premium
+      }
 
       const { side, sentiment } = detectSide(avgPrice, bid, ask, contractType);
       const { otmPercent, otmLabel } = calculateOTM(strike, spotPrice, contractType);
