@@ -729,14 +729,14 @@ async function fetchOptionsChain(ticker) {
     
     console.log(`📡 Fetching options chain for ${ticker} from Massive.com...`);
     
-    // STEP 1: First, fetch ALL available expiration dates from contracts endpoint
-    // This ensures we know all expirations before fetching snapshot data
-    console.log(`📅 Step 1: Fetching all available expiration dates from contracts endpoint...`);
+    // STEP 1: OPTIMIZED - Fetch expiration dates from contracts endpoint (limited pages for speed)
+    // We only need expiration dates for UI, not all contracts
+    console.log(`📅 Step 1: Fetching expiration dates from contracts endpoint (limited pages for speed)...`);
     const contractsUrl = `https://api.massive.com/v3/reference/options/contracts`;
     let allAvailableExpirations = new Set();
     let contractsCurrentUrl = contractsUrl;
     let contractsPageCount = 0;
-    const maxContractsPages = 50;
+    const maxContractsPages = 10; // Reduced from 50 - we only need expiration dates, not all contracts
     
     while (contractsPageCount < maxContractsPages) {
       try {
@@ -771,7 +771,8 @@ async function fetchOptionsChain(ticker) {
             }
             contractsCurrentUrl = nextUrl;
             contractsPageCount++;
-            await new Promise(resolve => setTimeout(resolve, 100));
+            // Reduced delay for faster fetching
+            await new Promise(resolve => setTimeout(resolve, 50));
           } else {
             break;
           }
@@ -795,7 +796,7 @@ async function fetchOptionsChain(ticker) {
     const url = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
     let currentUrl = url;
     let pageCount = 0;
-    const maxPages = 200; // Fetch many pages to get all expirations
+    const maxPages = 100; // Reduced from 200 to speed up - most tickers don't need 200 pages
       
     while (pageCount < maxPages) {
       try {
@@ -836,7 +837,8 @@ async function fetchOptionsChain(ticker) {
             currentUrl = nextUrl;
             pageCount++;
             console.log(`📄 Moving to page ${pageCount + 1}...`);
-            await new Promise(resolve => setTimeout(resolve, 100));
+            // Reduced delay from 100ms to 50ms for faster fetching
+            await new Promise(resolve => setTimeout(resolve, 50));
           } else {
             console.log(`✅ No more pages (next_url: ${response.data.next_url ? 'exists' : 'null'})`);
             break;
@@ -899,32 +901,9 @@ async function fetchOptionsChain(ticker) {
     
     console.log(`📅 Found ${snapshotExpirations.size} expiration dates in snapshot data`);
     
-    // Only filter if we have expiration dates from contracts endpoint AND they match
-    // Otherwise, use all contracts from snapshot (they have their own expiration dates)
-    if (sortedExpirations.length > 0 && allContracts.length > 0) {
-      // Check how many contracts match
-      const expirationSet = new Set(sortedExpirations);
-      const matchingContracts = allContracts.filter(c => {
-        const expDate = c.details?.expiration_date || c.expiration_date;
-        if (!expDate) return false;
-        const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-        return expirationSet.has(dateStr);
-      });
-      
-      console.log(`📊 Matching contracts: ${matchingContracts.length} out of ${allContracts.length}`);
-      
-      // Only use filtered contracts if we still have a reasonable amount (>50% or >100 contracts)
-      if (matchingContracts.length > allContracts.length * 0.5 || matchingContracts.length > 100) {
-        allContracts = matchingContracts;
-        console.log(`✅ Using filtered contracts (${matchingContracts.length})`);
-      } else {
-        console.log(`⚠️ Filtering removed too many contracts (${matchingContracts.length} from ${allContracts.length}), using ALL snapshot contracts`);
-        // Use all contracts - they have their own expiration dates
-      }
-    } else if (sortedExpirations.length === 0 && allContracts.length > 0) {
-      console.log(`⚠️ No expiration dates from contracts endpoint, but we have ${allContracts.length} contracts from snapshot - using all of them`);
-      // Use all contracts from snapshot
-    }
+    // OPTIMIZATION: Skip filtering step - use all snapshot contracts directly
+    // The snapshot API already returns contracts for all expirations, filtering is unnecessary overhead
+    console.log(`📊 Using all ${allContracts.length} contracts from snapshot (no filtering needed)`);
     
     // Count unique expiration dates in final contracts
     const seenExpirations = new Set();
