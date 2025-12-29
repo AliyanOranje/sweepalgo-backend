@@ -225,6 +225,11 @@ function calculateMaxPain(optionsChain, spotPrice) {
 // API ROUTES
 // ============================================
 
+// Test route to verify router is working
+router.get('/test', (req, res) => {
+  res.json({ success: true, message: 'GEX router is working!' });
+});
+
 /**
  * GET /api/gex/:ticker
  * Get Gamma Exposure analysis for a ticker
@@ -234,7 +239,9 @@ router.get('/:ticker', async (req, res) => {
     const { ticker } = req.params;
     const { expiration } = req.query; // Optional: filter by expiration
     
-    console.log(`📊 Fetching GEX data for ${ticker}...`);
+    console.log(`📊 [GEX Route] Fetching GEX data for ${ticker}...`);
+    console.log(`📊 [GEX Route] Request params:`, req.params);
+    console.log(`📊 [GEX Route] Request query:`, req.query);
     
     // Fetch options chain from Polygon.io/Massive.com
     let optionsChain;
@@ -270,6 +277,11 @@ router.get('/:ticker', async (req, res) => {
     
     if (!optionsChain || optionsChain.length === 0) {
       console.warn(`⚠️ No options chain data available for ${ticker}`);
+      console.warn(`⚠️ This could be due to:`);
+      console.warn(`   - API rate limiting`);
+      console.warn(`   - Invalid ticker symbol`);
+      console.warn(`   - Market hours (if outside trading hours)`);
+      console.warn(`   - API key issues`);
       return res.status(404).json({
         success: false,
         error: 'No options chain data available',
@@ -277,6 +289,8 @@ router.get('/:ticker', async (req, res) => {
         message: 'The options chain API returned no results. This may be due to market hours, ticker symbol, or API limitations.',
       });
     }
+    
+    console.log(`✅ Successfully fetched ${optionsChain.length} contracts for ${ticker}`);
     
     // Get spot price
     const spotPrice = getSpotPrice(optionsChain);
@@ -332,36 +346,34 @@ router.get('/:ticker', async (req, res) => {
         const timeToExp = daysToYears(daysToExp);
         
         // Aggregate call gamma and OI
+        // CRITICAL: Use gamma directly from API. Exclude contracts without gamma.
         let callGamma = 0;
         let callOI = 0;
         let callGEX = 0;
         
         for (const call of calls) {
-          // Polygon.io uses greeks.mid_iv for implied volatility
-          const iv = call.greeks?.mid_iv || 
-                     call.greeks?.implied_volatility || 
-                     call.implied_volatility || 
-                     call.impliedVolatility || 
-                     call.iv || 0.3;
+          // Get gamma directly from API - DO NOT calculate from IV
+          const gamma = call.greeks?.gamma;
           
-          const greeks = calculateAllGreeks(
-            spotPrice,
-            strikeNum,
-            timeToExp,
-            RISK_FREE_RATE,
-            iv,
-            true // isCall
-          );
+          // CRITICAL: Exclude contracts without gamma (cannot use IV as fallback)
+          if (!gamma || gamma === null || gamma === undefined || isNaN(gamma)) {
+            continue; // Skip this contract
+          }
           
-          // Polygon.io uses open_interest directly
+          // Get open interest
           const oi = call.open_interest || call.openInterest || call.oi || 0;
           
-          callGamma += greeks.gamma * oi;
+          // Skip contracts with zero OI
+          if (oi === 0 || oi === null || oi === undefined) {
+            continue;
+          }
+          
+          callGamma += gamma * oi;
           callOI += oi;
           
-          // Calculate GEX for this call
+          // Calculate GEX for this call: gamma × OI × 100 × spot_price² × direction
           const singleGEX = calculateSingleGEX(
-            greeks.gamma,
+            gamma,
             oi,
             spotPrice,
             'call'
@@ -370,36 +382,34 @@ router.get('/:ticker', async (req, res) => {
         }
         
         // Aggregate put gamma and OI
+        // CRITICAL: Use gamma directly from API. Exclude contracts without gamma.
         let putGamma = 0;
         let putOI = 0;
         let putGEX = 0;
         
         for (const put of puts) {
-          // Polygon.io uses greeks.mid_iv for implied volatility
-          const iv = put.greeks?.mid_iv || 
-                     put.greeks?.implied_volatility || 
-                     put.implied_volatility || 
-                     put.impliedVolatility || 
-                     put.iv || 0.3;
+          // Get gamma directly from API - DO NOT calculate from IV
+          const gamma = put.greeks?.gamma;
           
-          const greeks = calculateAllGreeks(
-            spotPrice,
-            strikeNum,
-            timeToExp,
-            RISK_FREE_RATE,
-            iv,
-            false // isPut
-          );
+          // CRITICAL: Exclude contracts without gamma (cannot use IV as fallback)
+          if (!gamma || gamma === null || gamma === undefined || isNaN(gamma)) {
+            continue; // Skip this contract
+          }
           
-          // Polygon.io uses open_interest directly
+          // Get open interest
           const oi = put.open_interest || put.openInterest || put.oi || 0;
           
-          putGamma += greeks.gamma * oi;
+          // Skip contracts with zero OI
+          if (oi === 0 || oi === null || oi === undefined) {
+            continue;
+          }
+          
+          putGamma += gamma * oi;
           putOI += oi;
           
-          // Calculate GEX for this put
+          // Calculate GEX for this put: gamma × OI × 100 × spot_price² × direction
           const singleGEX = calculateSingleGEX(
-            greeks.gamma,
+            gamma,
             oi,
             spotPrice,
             'put'
@@ -442,28 +452,31 @@ router.get('/:ticker', async (req, res) => {
     }
     
     // Calculate key levels (gamma wall, support, resistance, max pain)
+    // CRITICAL: Use gamma directly from API, exclude contracts without gamma
     const allContracts = Object.values(contractsByExpiration).flat();
     const keyLevels = findKeyGEXLevels(
-      allContracts.map(c => {
-        // Polygon.io uses details.strike_price and details.expiration_date
-        const strike = parseFloat(c.details?.strike_price || c.strike_price || c.strike);
-        const expirationDate = new Date(c.details?.expiration_date || c.expiration_date || c.expirationDate || c.expiry);
-        const daysToExp = Math.max(1, Math.ceil((expirationDate - new Date()) / (1000 * 60 * 60 * 24)));
-        const timeToExp = daysToYears(daysToExp);
-        const iv = c.greeks?.mid_iv || c.implied_volatility || c.impliedVolatility || c.iv || 0.3;
-        
-        const contractType = (c.details?.contract_type || c.contract_type || c.type || '').toLowerCase();
-        const isCall = contractType === 'call' || contractType === 'c';
-        const greeks = calculateAllGreeks(spotPrice, strike, timeToExp, RISK_FREE_RATE, iv, isCall);
-        
-        return {
-          strike,
-          callGamma: isCall ? greeks.gamma : 0,
-          putGamma: !isCall ? greeks.gamma : 0,
-          callOI: isCall ? (c.open_interest || c.openInterest || c.oi || 0) : 0,
-          putOI: !isCall ? (c.open_interest || c.openInterest || c.oi || 0) : 0,
-        };
-      }),
+      allContracts
+        .filter(c => {
+          // Only include contracts with valid gamma
+          const gamma = c.greeks?.gamma;
+          return gamma !== null && gamma !== undefined && !isNaN(gamma);
+        })
+        .map(c => {
+          // Polygon.io uses details.strike_price and details.expiration_date
+          const strike = parseFloat(c.details?.strike_price || c.strike_price || c.strike);
+          const gamma = c.greeks?.gamma || 0;
+          const contractType = (c.details?.contract_type || c.contract_type || c.type || '').toLowerCase();
+          const isCall = contractType === 'call' || contractType === 'c';
+          const oi = c.open_interest || c.openInterest || c.oi || 0;
+          
+          return {
+            strike,
+            callGamma: isCall ? gamma : 0,
+            putGamma: !isCall ? gamma : 0,
+            callOI: isCall ? oi : 0,
+            putOI: !isCall ? oi : 0,
+          };
+        }),
       spotPrice
     );
     
@@ -483,27 +496,34 @@ router.get('/:ticker', async (req, res) => {
     });
     
     // Calculate aggregate Delta and Gamma from all contracts
+    // CRITICAL: Use gamma and delta directly from API
     allContracts.forEach(c => {
       const strike = parseFloat(c.details?.strike_price || c.strike_price || c.strike);
       if (isNaN(strike)) return;
       
-      const expirationDate = new Date(c.details?.expiration_date || c.expiration_date || c.expirationDate || c.expiry);
-      const daysToExp = Math.max(1, Math.ceil((expirationDate - new Date()) / (1000 * 60 * 60 * 24)));
-      const timeToExp = daysToYears(daysToExp);
-      const iv = c.greeks?.mid_iv || c.implied_volatility || c.impliedVolatility || c.iv || 0.3;
+      // Get gamma and delta directly from API - DO NOT calculate from IV
+      const gamma = c.greeks?.gamma;
+      const delta = c.greeks?.delta;
       
-      const contractType = (c.details?.contract_type || c.contract_type || c.type || '').toLowerCase();
-      const isCall = contractType === 'call' || contractType === 'c';
-      const greeks = calculateAllGreeks(spotPrice, strike, timeToExp, RISK_FREE_RATE, iv, isCall);
+      // Skip contracts without gamma or delta
+      if (!gamma || gamma === null || gamma === undefined || isNaN(gamma)) {
+        return;
+      }
       
       const oi = c.open_interest || c.openInterest || c.oi || 0;
+      if (oi === 0 || oi === null || oi === undefined) {
+        return;
+      }
+      
       const contractMultiplier = 100; // Standard options contract multiplier
       
-      // Aggregate delta: delta * OI * multiplier
-      totalDelta += greeks.delta * oi * contractMultiplier;
+      // Aggregate delta: delta * OI * multiplier (use API delta if available, else 0)
+      if (delta !== null && delta !== undefined && !isNaN(delta)) {
+        totalDelta += delta * oi * contractMultiplier;
+      }
       
       // Aggregate gamma: gamma * OI * multiplier
-      totalGamma += greeks.gamma * oi * contractMultiplier;
+      totalGamma += gamma * oi * contractMultiplier;
     });
     
     // Find gamma flip point
@@ -694,8 +714,10 @@ router.get('/:ticker/heatmap', async (req, res) => {
 // ============================================
 
 /**
- * Fetch options chain from Massive.com (same as options flow)
- * Uses the exact same endpoint and pagination pattern as options flow
+ * Fetch options chain from Massive.com
+ * CRITICAL: Fetches ALL expiration dates by:
+ * 1. First getting all available expiration dates from contracts endpoint
+ * 2. Then fetching snapshot data for each expiration date
  */
 async function fetchOptionsChain(ticker) {
   try {
@@ -705,232 +727,223 @@ async function fetchOptionsChain(ticker) {
       throw new Error('POLYGON_API_KEY not set');
     }
     
-    console.log(`📡 Fetching options chain for ${ticker} from Massive.com (same as options flow)...`);
+    console.log(`📡 Fetching options chain for ${ticker} from Massive.com...`);
     
-    // Use Massive.com endpoint - IMPORTANT: Don't filter by expiration_date to get ALL expiration dates
-    // The API will return contracts for all expiration dates if we don't specify expiration_date filter
-    const url = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
+    // STEP 1: First, fetch ALL available expiration dates from contracts endpoint
+    // This ensures we know all expirations before fetching snapshot data
+    console.log(`📅 Step 1: Fetching all available expiration dates from contracts endpoint...`);
+    const contractsUrl = `https://api.massive.com/v3/reference/options/contracts`;
+    let allAvailableExpirations = new Set();
+    let contractsCurrentUrl = contractsUrl;
+    let contractsPageCount = 0;
+    const maxContractsPages = 50;
     
-    // Handle pagination - fetch ALL pages
-    // CRITICAL: Parse next_url and remove expiration_date filters to get all expirations
-    let allContracts = [];
-    let currentUrl = url;
-    let pageCount = 0;
-    const maxPages = 200; // Same limit as options flow
-    const seenExpirations = new Set();
-    
-    while (pageCount < maxPages) {
+    while (contractsPageCount < maxContractsPages) {
       try {
-        // Build params - ensure we don't filter by expiration_date
-        const params = pageCount === 0 
-          ? { 
-              apiKey: apiKey,
-              limit: 1000, // Maximum per page
-              // Explicitly don't include expiration_date filter
-            } 
-          : {};
-        
-        const response = await axios.get(currentUrl, {
-          params: Object.keys(params).length > 0 ? params : undefined,
+        const contractsResponse = await axios.get(contractsCurrentUrl, {
+          params: contractsPageCount === 0 ? {
+            underlying_ticker: ticker.toUpperCase(),
+            apiKey: apiKey,
+            limit: 100, // API maximum per page (not 1000!)
+          } : undefined,
           timeout: 60000,
         });
         
-        if (response.data?.results && response.data.results.length > 0) {
-          // Track expiration dates on this page
-          const currentPageExpirations = new Set();
-          response.data.results.forEach(c => {
-            const expDate = c.details?.expiration_date || c.expiration_date;
+        if (contractsResponse.data?.results && contractsResponse.data.results.length > 0) {
+          contractsResponse.data.results.forEach(c => {
+            const expDate = c.expiration_date || c.details?.expiration_date;
             if (expDate) {
               const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-              currentPageExpirations.add(dateStr);
-              seenExpirations.add(dateStr);
+              allAvailableExpirations.add(dateStr);
             }
           });
           
-          allContracts = allContracts.concat(response.data.results);
-          
-          // Check for next page
-          if (response.data.next_url && pageCount < maxPages - 1) {
-            currentUrl = response.data.next_url;
-            pageCount++;
-            
-            // If we're only seeing one expiration date repeatedly after several pages,
-            // the API cursor is filtering by expiration_date. We need a different strategy.
-            if (currentPageExpirations.size === 1 && seenExpirations.size === 1 && pageCount > 3) {
-              // Break from this loop and fetch other expiration dates using contracts endpoint
-              break;
+          if (contractsResponse.data.next_url && contractsPageCount < maxContractsPages - 1) {
+            let nextUrl = contractsResponse.data.next_url;
+            try {
+              const urlObj = new URL(nextUrl);
+              if (!urlObj.searchParams.has('apiKey')) {
+                urlObj.searchParams.set('apiKey', apiKey);
+                nextUrl = urlObj.toString();
+              }
+            } catch (e) {
+              nextUrl = `${contractsResponse.data.next_url}${contractsResponse.data.next_url.includes('?') ? '&' : '?'}apiKey=${apiKey}`;
             }
-            
-            await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between pages
+            contractsCurrentUrl = nextUrl;
+            contractsPageCount++;
+            await new Promise(resolve => setTimeout(resolve, 100));
           } else {
-            break; // No more pages
+            break;
           }
         } else {
-          break; // No results on this page
+          break;
+        }
+      } catch (contractsError) {
+        console.warn(`⚠️ Error fetching contracts page ${contractsPageCount + 1}:`, contractsError.message);
+        break;
+      }
+    }
+    
+    const sortedExpirations = Array.from(allAvailableExpirations).sort();
+    console.log(`✅ Found ${allAvailableExpirations.size} expiration dates from contracts endpoint:`, sortedExpirations.slice(0, 20));
+    
+    // STEP 2: Fetch ALL snapshot data (single call, paginated)
+    // CRITICAL: Snapshot endpoint does NOT paginate by expiry - it returns mixed expirations
+    // We fetch all pages once, then group locally by expiration_date + strike_price
+    console.log(`📡 Step 2: Fetching ALL snapshot data (paginated, mixed expirations - will group locally)...`);
+    let allContracts = [];
+    const url = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
+    let currentUrl = url;
+    let pageCount = 0;
+    const maxPages = 200; // Fetch many pages to get all expirations
+      
+    while (pageCount < maxPages) {
+      try {
+        // Use same parameters as optionsFlow.js for consistency
+        // CRITICAL: limit must be 100 (API max per page), not 1000
+        // CRITICAL: For page 0, pass params. For subsequent pages (next_url), don't pass params - URL already has everything
+        const response = await axios.get(currentUrl, {
+          params: pageCount === 0 ? {
+            apiKey: apiKey,
+            order: 'asc',
+            limit: 100, // API maximum per page (not 1000!)
+            sort: 'ticker',
+          } : undefined, // Don't pass params for next_url pages - URL already contains cursor and params
+          timeout: 60000,
+        });
+        
+        console.log(`📡 API Response status: ${response.status}, results count: ${response.data?.results?.length || 0}`);
+        
+        // Check if results is an array (like optionsFlow.js does)
+        if (response.data?.results && Array.isArray(response.data.results) && response.data.results.length > 0) {
+          allContracts = allContracts.concat(response.data.results);
+          console.log(`📄 Page ${pageCount + 1}: Fetched ${response.data.results.length} contracts (total: ${allContracts.length})`);
+          
+          if (response.data.next_url && pageCount < maxPages - 1) {
+            // CRITICAL: next_url doesn't include apiKey, we must append it
+            let nextUrl = response.data.next_url;
+            try {
+              const urlObj = new URL(nextUrl);
+              // Remove existing apiKey if present (to avoid duplicates)
+              urlObj.searchParams.delete('apiKey');
+              // Add our API key
+              urlObj.searchParams.set('apiKey', apiKey);
+              nextUrl = urlObj.toString();
+            } catch (e) {
+              // If URL parsing fails, append API key as query param
+              nextUrl = `${response.data.next_url}${response.data.next_url.includes('?') ? '&' : '?'}apiKey=${apiKey}`;
+            }
+            currentUrl = nextUrl;
+            pageCount++;
+            console.log(`📄 Moving to page ${pageCount + 1}...`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } else {
+            console.log(`✅ No more pages (next_url: ${response.data.next_url ? 'exists' : 'null'})`);
+            break;
+          }
+        } else {
+          console.log(`⚠️ Page ${pageCount + 1}: No results`);
+          console.log(`⚠️ Response structure:`, {
+            hasResults: !!response.data?.results,
+            isArray: Array.isArray(response.data?.results),
+            resultsLength: response.data?.results?.length || 0,
+            status: response.data?.status,
+            requestId: response.data?.request_id,
+          });
+          if (pageCount === 0) {
+            // First page has no results - log the full response for debugging
+            console.log(`⚠️ First page full response:`, JSON.stringify(response.data, null, 2).substring(0, 1000));
+          }
+          break;
         }
       } catch (error) {
-        console.error(`❌ Error fetching ${ticker} page ${pageCount + 1}:`, error.message);
+        console.error(`❌ Error fetching snapshot page ${pageCount + 1}:`, error.message);
+        if (error.response) {
+          console.error(`❌ Response status: ${error.response.status}`);
+          console.error(`❌ Response data:`, JSON.stringify(error.response.data, null, 2).substring(0, 500));
+        }
         if (error.response?.status === 429) {
           // Rate limited - wait longer
           console.log(`⏳ Rate limited, waiting 2 seconds...`);
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue; // Retry this page
+        } else if (error.response?.status === 404) {
+          console.error(`❌ 404 - Ticker ${ticker} not found or has no options`);
+          break;
         } else {
-          throw error; // Re-throw other errors
+          break;
         }
       }
     }
     
     console.log(`✅ Successfully fetched ${allContracts.length} total contracts across ${pageCount} page(s)`);
-    console.log(`📅 Unique expiration dates found so far: ${seenExpirations.size}`);
-    console.log(`📅 Expiration dates:`, Array.from(seenExpirations).sort());
     
-    // ALWAYS try to fetch contracts for multiple expiration dates
-    // The snapshot API might return contracts for multiple expirations, but we want to ensure we get ALL
-    if (allContracts.length > 0) {
-      // Count actual expiration dates in fetched contracts
-      const actualExpirationsInContracts = new Set();
-      allContracts.forEach(c => {
+    if (allContracts.length === 0) {
+      console.warn(`⚠️ No contracts fetched from snapshot API for ${ticker}`);
+      console.warn(`⚠️ This could mean:`);
+      console.warn(`   - The ticker has no options contracts`);
+      console.warn(`   - API rate limiting`);
+      console.warn(`   - API key issues`);
+      return [];
+    }
+    
+    // Count expiration dates in snapshot data first
+    const snapshotExpirations = new Set();
+    allContracts.forEach(c => {
+      const expDate = c.details?.expiration_date || c.expiration_date;
+      if (expDate) {
+        const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
+        snapshotExpirations.add(dateStr);
+      }
+    });
+    
+    console.log(`📅 Found ${snapshotExpirations.size} expiration dates in snapshot data`);
+    
+    // Only filter if we have expiration dates from contracts endpoint AND they match
+    // Otherwise, use all contracts from snapshot (they have their own expiration dates)
+    if (sortedExpirations.length > 0 && allContracts.length > 0) {
+      // Check how many contracts match
+      const expirationSet = new Set(sortedExpirations);
+      const matchingContracts = allContracts.filter(c => {
         const expDate = c.details?.expiration_date || c.expiration_date;
-        if (expDate) {
-          const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-          actualExpirationsInContracts.add(dateStr);
-        }
+        if (!expDate) return false;
+        const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
+        return expirationSet.has(dateStr);
       });
       
-      // ALWAYS try to fetch more expiration dates if we have fewer than 10
-      // Most liquid stocks have 15-30+ expiration dates available
-      if (actualExpirationsInContracts.size < 10) {
-        try {
-          // Use contracts endpoint to get ALL available expiration dates for this ticker
-          // We need to paginate through contracts endpoint to get all expiration dates
-          const contractsUrl = `https://api.massive.com/v3/reference/options/contracts`;
-          let allAvailableExpirations = new Set();
-          let contractsCurrentUrl = contractsUrl;
-          let contractsPageCount = 0;
-          const maxContractsPages = 50;
-          
-          while (contractsPageCount < maxContractsPages) {
-            try {
-              const contractsResponse = await axios.get(contractsCurrentUrl, {
-                params: contractsPageCount === 0 ? {
-                  underlying_ticker: ticker.toUpperCase(),
-                  apiKey: apiKey,
-                  limit: 1000,
-                } : undefined,
-                timeout: 60000,
-              });
-              
-              if (contractsResponse.data?.results && contractsResponse.data.results.length > 0) {
-                // Extract expiration dates from this page
-                contractsResponse.data.results.forEach(c => {
-                  const expDate = c.expiration_date || c.details?.expiration_date;
-                  if (expDate) {
-                    const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-                    allAvailableExpirations.add(dateStr);
-                  }
-                });
-                
-                if (contractsResponse.data.next_url && contractsPageCount < maxContractsPages - 1) {
-                  // next_url might not include API key, so we need to append it
-                  let nextUrl = contractsResponse.data.next_url;
-                  try {
-                    const urlObj = new URL(nextUrl);
-                    if (!urlObj.searchParams.has('apiKey')) {
-                      urlObj.searchParams.set('apiKey', apiKey);
-                      nextUrl = urlObj.toString();
-                    }
-                  } catch (e) {
-                    // If URL parsing fails, try appending API key as query param
-                    nextUrl = `${contractsResponse.data.next_url}${contractsResponse.data.next_url.includes('?') ? '&' : '?'}apiKey=${apiKey}`;
-                  }
-                  contractsCurrentUrl = nextUrl;
-                  contractsPageCount++;
-                  await new Promise(resolve => setTimeout(resolve, 100));
-                } else {
-                  break;
-                }
-              } else {
-                break;
-              }
-            } catch (contractsPageError) {
-              console.warn(`⚠️ Error fetching contracts page ${contractsPageCount + 1}:`, contractsPageError.message);
-              break;
-            }
-          }
-          
-          const sortedExpirations = Array.from(allAvailableExpirations).sort();
-          
-          if (allAvailableExpirations.size > 0) {
-            // For each expiration date we haven't fetched yet, make a snapshot API call
-            const expirationDatesToFetch = sortedExpirations.filter(exp => !actualExpirationsInContracts.has(exp));
-            
-            // Fetch up to 25 expiration dates for comprehensive coverage
-            for (const expDate of expirationDatesToFetch.slice(0, 25)) {
-            try {
-              // Make snapshot API call with expiration_date filter
-              const expSnapshotUrl = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
-              let expContracts = [];
-              let expCurrentUrl = expSnapshotUrl;
-              let expPageCount = 0;
-              
-              while (expPageCount < 50) { // Limit pages per expiration
-                const expResponse = await axios.get(expCurrentUrl, {
-                  params: expPageCount === 0 ? {
-                    apiKey: apiKey,
-                    'expiration_date': expDate, // Filter by specific expiration date
-                    limit: 1000,
-                  } : undefined,
-                  timeout: 60000,
-                });
-                
-                if (expResponse.data?.results && expResponse.data.results.length > 0) {
-                  expContracts = expContracts.concat(expResponse.data.results);
-                  
-                  if (expResponse.data.next_url && expPageCount < 49) {
-                    expCurrentUrl = expResponse.data.next_url;
-                    expPageCount++;
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                  } else {
-                    break;
-                  }
-                } else {
-                  break;
-                }
-              }
-              
-              if (expContracts.length > 0) {
-                allContracts = allContracts.concat(expContracts);
-                actualExpirationsInContracts.add(expDate);
-                seenExpirations.add(expDate);
-              }
-              
-              // Rate limiting delay between expiration date fetches
-              await new Promise(resolve => setTimeout(resolve, 200));
-            } catch (expError) {
-              console.warn(`⚠️ Error fetching expiration ${expDate}:`, expError.message);
-            }
-            }
-          }
-        } catch (contractsError) {
-          console.warn(`⚠️ Could not fetch additional expiration dates:`, contractsError.message);
-          if (contractsError.response) {
-            console.warn(`⚠️ Response status:`, contractsError.response.status);
-            console.warn(`⚠️ Response data:`, JSON.stringify(contractsError.response.data, null, 2));
-          }
-        }
+      console.log(`📊 Matching contracts: ${matchingContracts.length} out of ${allContracts.length}`);
+      
+      // Only use filtered contracts if we still have a reasonable amount (>50% or >100 contracts)
+      if (matchingContracts.length > allContracts.length * 0.5 || matchingContracts.length > 100) {
+        allContracts = matchingContracts;
+        console.log(`✅ Using filtered contracts (${matchingContracts.length})`);
+      } else {
+        console.log(`⚠️ Filtering removed too many contracts (${matchingContracts.length} from ${allContracts.length}), using ALL snapshot contracts`);
+        // Use all contracts - they have their own expiration dates
       }
+    } else if (sortedExpirations.length === 0 && allContracts.length > 0) {
+      console.log(`⚠️ No expiration dates from contracts endpoint, but we have ${allContracts.length} contracts from snapshot - using all of them`);
+      // Use all contracts from snapshot
     }
+    
+    // Count unique expiration dates in final contracts
+    const seenExpirations = new Set();
+    allContracts.forEach(c => {
+      const expDate = c.details?.expiration_date || c.expiration_date;
+      if (expDate) {
+        const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
+        seenExpirations.add(dateStr);
+      }
+    });
+    
+    console.log(`📅 Final expiration dates with data: ${seenExpirations.size}`, Array.from(seenExpirations).sort().slice(0, 10));
     
     if (allContracts.length > 0) {
       // Count unique expiration dates and strikes
       const uniqueExpirations = new Set();
       const uniqueStrikes = new Set();
-      const expirationDateFields = new Set();
-      const expirationSamples = {};
       
-      allContracts.forEach((c, idx) => {
-        // Try multiple field paths for expiration date
+      allContracts.forEach((c) => {
         const expDate = c.details?.expiration_date || 
                        c.expiration_date || 
                        c.expirationDate ||
@@ -950,21 +963,6 @@ async function fetchOptionsChain(ticker) {
               dateStr = new Date(expDate).toISOString().split('T')[0];
             }
             uniqueExpirations.add(dateStr);
-            
-            // Track which field was used (sample first 5 contracts)
-            if (idx < 5) {
-              if (c.details?.expiration_date) expirationDateFields.add('details.expiration_date');
-              else if (c.expiration_date) expirationDateFields.add('expiration_date');
-              else if (c.expiry) expirationDateFields.add('expiry');
-              
-              if (!expirationSamples[dateStr]) {
-                expirationSamples[dateStr] = [];
-              }
-              expirationSamples[dateStr].push({
-                strike: c.details?.strike_price || c.strike_price,
-                type: c.details?.contract_type || c.contract_type,
-              });
-            }
           } catch (e) {
             console.warn(`⚠️ Failed to parse expiration date:`, expDate, e.message);
           }
@@ -979,71 +977,8 @@ async function fetchOptionsChain(ticker) {
       const sortedExpirations = Array.from(uniqueExpirations).sort();
       const sortedStrikes = Array.from(uniqueStrikes).sort((a, b) => b - a);
       
-      // If we only found one expiration date, try to fetch more using contracts endpoint
-      if (uniqueExpirations.size === 1) {
-        console.warn(`⚠️ WARNING: Only found 1 expiration date (${sortedExpirations[0]})!`);
-        console.warn(`⚠️ Snapshot API may only return nearest expiration. Trying contracts endpoint...`);
-        
-        try {
-          // Use contracts endpoint to get all available expiration dates
-          const contractsUrl = `https://api.massive.com/v3/reference/options/contracts`;
-          let additionalContracts = [];
-          let contractsPageCount = 0;
-          let contractsCurrentUrl = contractsUrl;
-          const maxContractsPages = 50;
-          
-          while (contractsPageCount < maxContractsPages) {
-            const contractsResponse = await axios.get(contractsCurrentUrl, {
-              params: contractsPageCount === 0 ? {
-                underlying_ticker: ticker.toUpperCase(),
-                apiKey: apiKey,
-                limit: 1000,
-              } : undefined,
-              timeout: 60000,
-            });
-            
-            if (contractsResponse.data?.results && contractsResponse.data.results.length > 0) {
-              // Filter contracts that have expiration dates different from what we already have
-              const newContracts = contractsResponse.data.results.filter(c => {
-                const expDate = c.expiration_date || c.details?.expiration_date;
-                if (!expDate) return false;
-                const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-                return !uniqueExpirations.has(dateStr);
-              });
-              
-              if (newContracts.length > 0) {
-                additionalContracts = additionalContracts.concat(newContracts);
-                console.log(`📊 Found ${newContracts.length} additional contracts with different expiration dates`);
-              }
-              
-              if (contractsResponse.data.next_url && contractsPageCount < maxContractsPages - 1) {
-                contractsCurrentUrl = contractsResponse.data.next_url;
-                contractsPageCount++;
-                await new Promise(resolve => setTimeout(resolve, 100));
-              } else {
-                break;
-              }
-            } else {
-              break;
-            }
-          }
-          
-          if (additionalContracts.length > 0) {
-            allContracts = allContracts.concat(additionalContracts);
-            
-            // Re-count expiration dates
-            additionalContracts.forEach(c => {
-              const expDate = c.expiration_date || c.details?.expiration_date;
-              if (expDate) {
-                const dateStr = typeof expDate === 'string' ? expDate.split('T')[0] : new Date(expDate).toISOString().split('T')[0];
-                uniqueExpirations.add(dateStr);
-              }
-            });
-          }
-        } catch (error) {
-          console.warn(`⚠️ Failed to fetch additional contracts:`, error.message);
-        }
-      }
+      console.log(`📊 Final summary: ${allContracts.length} contracts, ${uniqueExpirations.size} expiration dates, ${uniqueStrikes.size} strikes`);
+      console.log(`📅 Final expiration dates:`, sortedExpirations);
       
       return allContracts;
     } else {
@@ -1070,9 +1005,25 @@ async function fetchOptionsChain(ticker) {
 function getSpotPrice(contracts) {
   if (contracts.length === 0) return 0;
   
-  // Try to get underlying price from first contract (try multiple field names)
+  // Try to get underlying price from contracts (API uses underlying_asset.price)
+  // Check multiple contracts to find one with price data
+  for (const contract of contracts) {
+    const underlyingPrice = contract.underlying_asset?.price ||
+                            contract.underlying_price || 
+                            contract.underlyingPrice || 
+                            contract.underlying?.price ||
+                            contract.details?.underlying_price ||
+                            contract.details?.underlyingPrice;
+    
+    if (underlyingPrice && !isNaN(parseFloat(underlyingPrice)) && parseFloat(underlyingPrice) > 0) {
+      return parseFloat(underlyingPrice);
+    }
+  }
+  
+  // Fallback: try first contract again
   const firstContract = contracts[0];
-  const underlyingPrice = firstContract.underlying_price || 
+  const underlyingPrice = firstContract.underlying_asset?.price ||
+                          firstContract.underlying_price || 
                           firstContract.underlyingPrice || 
                           firstContract.underlying?.price ||
                           firstContract.details?.underlying_price ||
