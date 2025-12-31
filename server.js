@@ -165,6 +165,33 @@ function broadcastTradeUpdate(trade) {
 // Make broadcastTradeUpdate available globally for optionsFlow route
 global.broadcastTradeUpdate = broadcastTradeUpdate;
 
+// Store GEX subscriptions (ticker -> Set<WebSocket>)
+const gexSubscriptions = new Map(); // Map<ticker, Set<WebSocket>>
+
+// Function to broadcast GEX updates to subscribed clients
+function broadcastGEXUpdate(ticker, gexData) {
+  const message = JSON.stringify({
+    type: 'gex-update',
+    ticker: ticker.toUpperCase(),
+    data: gexData,
+    timestamp: new Date().toISOString(),
+  });
+  
+  const subscribers = gexSubscriptions.get(ticker.toUpperCase()) || new Set();
+  subscribers.forEach((client) => {
+    if (client.readyState === 1) { // WebSocket.OPEN
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error sending GEX WebSocket message:', error);
+      }
+    }
+  });
+}
+
+// Make broadcastGEXUpdate available globally
+global.broadcastGEXUpdate = broadcastGEXUpdate;
+
 wss.on('connection', (ws) => {
   console.log('✅ Client connected to WebSocket');
   clients.add(ws);
@@ -183,12 +210,42 @@ wss.on('connection', (ws) => {
       console.log('Received from client:', data);
       
       // BUG #16 FIX: Handle subscriptions
-      if (data.type === 'subscribe' && data.channel === 'options-flow') {
-        ws.send(JSON.stringify({
-          type: 'subscribed',
-          channel: 'options-flow',
-          message: 'Subscribed to options flow updates',
-        }));
+      if (data.type === 'subscribe') {
+        if (data.channel === 'options-flow') {
+          ws.send(JSON.stringify({
+            type: 'subscribed',
+            channel: 'options-flow',
+            message: 'Subscribed to options flow updates',
+          }));
+        } else if (data.channel === 'gex' && data.ticker) {
+          // Subscribe to GEX updates for specific ticker
+          const ticker = data.ticker.toUpperCase();
+          if (!gexSubscriptions.has(ticker)) {
+            gexSubscriptions.set(ticker, new Set());
+          }
+          gexSubscriptions.get(ticker).add(ws);
+          
+          ws.send(JSON.stringify({
+            type: 'subscribed',
+            channel: 'gex',
+            ticker: ticker,
+            message: `Subscribed to GEX updates for ${ticker}`,
+          }));
+        }
+      }
+      
+      // Handle unsubscriptions
+      if (data.type === 'unsubscribe') {
+        if (data.channel === 'gex' && data.ticker) {
+          const ticker = data.ticker.toUpperCase();
+          const subscribers = gexSubscriptions.get(ticker);
+          if (subscribers) {
+            subscribers.delete(ws);
+            if (subscribers.size === 0) {
+              gexSubscriptions.delete(ticker);
+            }
+          }
+        }
       }
       
       // BUG #2 FIX: Handle ticker-specific subscriptions
@@ -242,6 +299,14 @@ wss.on('connection', (ws) => {
     console.log('❌ Client disconnected from WebSocket');
     clients.delete(ws);
     clientSubscriptions.delete(ws);
+    
+    // Remove from GEX subscriptions
+    gexSubscriptions.forEach((subscribers, ticker) => {
+      subscribers.delete(ws);
+      if (subscribers.size === 0) {
+        gexSubscriptions.delete(ticker);
+      }
+    });
   });
   
   ws.on('error', (error) => {

@@ -1,5 +1,6 @@
 import express from 'express';
 import axios from 'axios';
+import { recentTradesMap } from '../utils/optionsCalculations.js';
 
 const router = express.Router();
 
@@ -444,9 +445,17 @@ router.get('/:ticker', async (req, res) => {
       // Sort by strike (descending for display)
       strikeGEX.sort((a, b) => b.strike - a.strike);
       
+      // Calculate aggregate GEX for this expiration
+      const expNetGEX = strikeGEX.reduce((sum, s) => sum + (s.netGEX || 0), 0);
+      const expCallGEX = strikeGEX.reduce((sum, s) => sum + (s.callGEX || 0), 0);
+      const expPutGEX = strikeGEX.reduce((sum, s) => sum + (s.putGEX || 0), 0);
+      
       gexByExpiration[expDate] = {
         expiration: expDate,
         daysToExpiration: Math.max(1, Math.ceil((new Date(expDate) - new Date()) / (1000 * 60 * 60 * 24))),
+        netGEX: expNetGEX,
+        callGEX: expCallGEX,
+        putGEX: expPutGEX,
         strikes: strikeGEX,
       };
     }
@@ -599,29 +608,96 @@ router.get('/:ticker', async (req, res) => {
       };
     });
     
-    // Calculate flow deltas (change in GEX across expirations for each strike)
-    // Flow Delta = net change from earliest to latest expiration (shows flow direction)
-    const flowDeltas = finalStrikes.map((strike, strikeIdx) => {
-      const rowValues = heatmapData[strikeIdx]?.values || [];
-      const nonNullValues = rowValues.filter(v => v !== null && v !== undefined);
-      
-      if (nonNullValues.length === 0) {
-        return { val: 0 };
+    // Calculate flow deltas from Options Flow data (actual trades)
+    // Aggregate Options Flow trades by strike to show net buying/selling pressure
+    const flowDeltas = finalStrikes.map((strike) => {
+      try {
+        // Get all trades for this ticker from Options Flow store
+        const allTrades = Array.from(recentTradesMap.values());
+        const tickerTrades = allTrades.filter(trade => 
+          trade.ticker && trade.ticker.toUpperCase() === ticker.toUpperCase()
+        );
+        
+        // Filter trades for this specific strike (within $0.50 tolerance)
+        const strikeTrades = tickerTrades.filter(trade => {
+          if (!trade.strike) return false;
+          return Math.abs(trade.strike - strike) < 0.5;
+        });
+        
+        if (strikeTrades.length === 0) {
+          // Fallback: Calculate from GEX across expirations if no Options Flow data
+          const strikeIdx = finalStrikes.indexOf(strike);
+          const rowValues = heatmapData[strikeIdx]?.values || [];
+          const nonNullValues = rowValues.filter(v => v !== null && v !== undefined);
+          
+          if (nonNullValues.length === 0) {
+            return { val: 0, source: 'gex-fallback' };
+          }
+          
+          if (nonNullValues.length === 1) {
+            return { val: 0, source: 'gex-fallback' };
+          }
+          
+          const firstVal = nonNullValues[0];
+          const lastVal = nonNullValues[nonNullValues.length - 1];
+          const delta = lastVal - firstVal;
+          return { val: delta, source: 'gex-fallback' };
+        }
+        
+        // Calculate net flow: positive = buying pressure, negative = selling pressure
+        let netFlow = 0;
+        let callFlow = 0;
+        let putFlow = 0;
+        
+        strikeTrades.forEach(trade => {
+          // Premium represents flow direction: positive = buying, negative = selling
+          const premium = parseFloat(trade.premium) || 0;
+          const size = parseInt(trade.size) || 0;
+          
+          // Calculate flow contribution: premium × size (normalized)
+          // Calls contribute positive flow, puts contribute negative flow
+          const flowContribution = premium * (trade.type === 'CALL' ? 1 : -1);
+          
+          if (trade.type === 'CALL') {
+            callFlow += flowContribution;
+          } else {
+            putFlow += flowContribution;
+          }
+          
+          netFlow += flowContribution;
+        });
+        
+        // Normalize by number of trades to get average flow per strike
+        // Convert to millions for display
+        const normalizedFlow = netFlow / 1000000; // Convert to millions
+        
+        return { 
+          val: normalizedFlow, 
+          source: 'options-flow',
+          callFlow: callFlow / 1000000,
+          putFlow: putFlow / 1000000,
+          tradeCount: strikeTrades.length
+        };
+      } catch (error) {
+        console.warn(`⚠️ Error calculating flow delta for strike ${strike}:`, error.message);
+        // Fallback to GEX-based calculation
+        const strikeIdx = finalStrikes.indexOf(strike);
+        const rowValues = heatmapData[strikeIdx]?.values || [];
+        const nonNullValues = rowValues.filter(v => v !== null && v !== undefined);
+        
+        if (nonNullValues.length === 0) {
+          return { val: 0, source: 'error-fallback' };
+        }
+        
+        if (nonNullValues.length === 1) {
+          return { val: 0, source: 'error-fallback' };
+        }
+        
+        const firstVal = nonNullValues[0];
+        const lastVal = nonNullValues[nonNullValues.length - 1];
+        const delta = lastVal - firstVal;
+        return { val: delta, source: 'error-fallback' };
       }
-      
-      if (nonNullValues.length === 1) {
-        // Single expiration - no change to calculate
-        return { val: 0 };
-      }
-      
-      // Calculate change: latest expiration - earliest expiration
-      // This shows the net flow direction across time
-      const firstVal = nonNullValues[0];
-      const lastVal = nonNullValues[nonNullValues.length - 1];
-      const delta = lastVal - firstVal;
-      
-      // Return delta in original units (frontend will format it)
-      return { val: delta };
     });
     
     // Final verification of heatmap structure
@@ -658,6 +734,15 @@ router.get('/:ticker', async (req, res) => {
       byExpiration: gexByExpiration,
       keyLevels,
     };
+    
+    // Broadcast GEX update via WebSocket if available
+    if (global.broadcastGEXUpdate) {
+      try {
+        global.broadcastGEXUpdate(ticker, responseData);
+      } catch (error) {
+        console.warn('⚠️ Error broadcasting GEX update:', error.message);
+      }
+    }
     
     res.json(responseData);
   } catch (error) {
