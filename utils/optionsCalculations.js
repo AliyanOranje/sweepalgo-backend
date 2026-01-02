@@ -466,81 +466,136 @@ function detectOpeningClosing(volume, openInterest, previousOI) {
 /**
  * BUG #15 FIX: Calculate setup score correctly
  */
+/**
+ * Calculate Alert Score (0-10) based on MD file specification
+ * Components: Volume (3pts), Vol/OI Ratio (2.5pts), Premium Change (2pts), GEX Position (1.5pts), DTE Boost (1pt)
+ */
 function calculateSetupScore(trade) {
-  let score = 5; // Start neutral
+  let score = 0;
   const reasons = [];
   
-  // Volume scoring
-  if (trade.volume >= 5000) {
-    score += 2;
-    reasons.push('Massive volume (institutional interest)');
-  } else if (trade.volume >= 1000) {
-    score += 1;
-    reasons.push('High volume');
-  } else if (trade.volume < 10) {
-    score -= 3;
-    reasons.push('Very low volume (avoid)');
+  const volume = trade.volume || 0;
+  const openInterest = trade.openInterest || 0;
+  
+  // Handle DTE - can be string ("30d") or number (30)
+  let dteNum = 0;
+  if (typeof trade.dte === 'string') {
+    dteNum = parseInt(trade.dte.replace('d', '')) || 0;
+  } else if (typeof trade.dte === 'number') {
+    dteNum = trade.dte;
   }
   
-  // Open Interest scoring
-  if (trade.openInterest < 10) {
-    score -= 3;
-    reasons.push('No liquidity (OI < 10)');
-  } else if (trade.openInterest < 100) {
-    score -= 1;
-    reasons.push('Low liquidity');
-  } else if (trade.openInterest >= 1000) {
-    score += 1;
-    reasons.push('Good liquidity');
+  // Handle changePercent - can be from trade object or calculated
+  const changePercent = trade.changePercent || trade.priceChange || trade.day?.change_percent || 0;
+  const absChange = Math.abs(changePercent);
+  
+  // Handle GEX position - can be from trade object or 'unknown'
+  const gexPosition = trade.gexPosition || 'unknown';
+  
+  // 1. VOLUME SCORE (0-3 points)
+  // Scale: 0 → 0pts, 5000 → 1.5pts, 10000 → 2.5pts, 15000+ → 3pts
+  if (volume >= 15000) {
+    score += 3.0;
+    reasons.push('Massive volume (15K+)');
+  } else if (volume >= 10000) {
+    score += 2.5;
+    reasons.push('Very high volume (10K+)');
+  } else if (volume >= 5000) {
+    score += 1.5;
+    reasons.push('High volume (5K+)');
+  } else if (volume >= 1000) {
+    score += 0.75;
+    reasons.push('Moderate volume (1K+)');
+  } else if (volume > 0) {
+    score += (volume / 1000) * 0.75;
+    reasons.push(`Volume: ${volume.toLocaleString()}`);
+  } else {
+    reasons.push('No volume');
   }
   
-  // Premium scoring
-  const premium = trade.premiumRaw || parseFloat(trade.premium.replace(/[^0-9.]/g, '')) * 
-    (trade.premium.includes('M') ? 1000000 : (trade.premium.includes('K') ? 1000 : 1));
+  // 2. VOL/OI RATIO SCORE (0-2.5 points)
+  const volOiRatio = openInterest > 0 
+    ? volume / openInterest 
+    : volume > 0 ? 10 : 0;
   
-  if (premium >= 1000000) {
-    score += 2;
-    reasons.push('$1M+ premium (whale activity)');
-  } else if (premium >= 100000) {
-    score += 1;
-    reasons.push('Large premium');
-  } else if (premium < 10000) {
-    score -= 1;
-    reasons.push('Small premium');
+  if (volOiRatio >= 5.0) {
+    score += 2.5;
+    reasons.push('Extreme unusual activity (Vol/OI ≥ 5.0)');
+  } else if (volOiRatio >= 2.0) {
+    score += 2.0;
+    reasons.push('Very unusual activity (Vol/OI ≥ 2.0)');
+  } else if (volOiRatio >= 1.0) {
+    score += 1.5;
+    reasons.push('Unusual activity (Vol/OI ≥ 1.0)');
+  } else if (volOiRatio >= 0.5) {
+    score += 0.75;
+    reasons.push('Elevated activity (Vol/OI ≥ 0.5)');
+  } else if (volOiRatio > 0) {
+    score += volOiRatio * 1.5;
+    reasons.push(`Vol/OI: ${volOiRatio.toFixed(2)}x`);
+  } else {
+    reasons.push('No activity');
   }
   
-  // Trade type scoring
-  if (trade.tradeType === 'Sweep') {
-    score += 1;
-    reasons.push('Sweep (aggressive fill)');
-  } else if (trade.tradeType === 'Block') {
-    score += 1;
-    reasons.push('Block trade');
+  // 3. PREMIUM CHANGE SCORE (0-2 points)
+  if (absChange >= 100) {
+    score += 2.0;
+    reasons.push(`Extreme price move (${absChange.toFixed(0)}%+)`);
+  } else if (absChange >= 50) {
+    score += 1.5;
+    reasons.push(`Large price move (${absChange.toFixed(0)}%+)`);
+  } else if (absChange >= 25) {
+    score += 1.0;
+    reasons.push(`Significant price move (${absChange.toFixed(0)}%+)`);
+  } else if (absChange > 0) {
+    score += (absChange / 25) * 1.0;
+    reasons.push(`Price change: ${absChange.toFixed(0)}%`);
+  } else {
+    reasons.push('No price change');
   }
   
-  // Side scoring
-  if (trade.side === 'Above Ask' || trade.side === 'At Ask') {
-    score += 1;
-    reasons.push('Bought aggressively at ask');
+  // 4. GEX POSITION SCORE (0-1.5 points)
+  if (gexPosition === 'below') {
+    score += 1.5;
+    reasons.push('Below gamma wall (bullish setup)');
+  } else if (gexPosition === 'at') {
+    score += 0.75;
+    reasons.push('At gamma wall (pivotal level)');
+  } else if (gexPosition === 'above') {
+    score += 0.25;
+    reasons.push('Above gamma wall (resistance ahead)');
+  } else {
+    reasons.push('GEX position unknown');
   }
   
-  // DTE scoring
-  const dteNum = parseInt(trade.dte?.replace('d', '')) || 0;
+  // 5. DTE BOOST (0-1 points)
+  // Near-term options get a boost (more actionable)
   if (dteNum === 0) {
-    score -= 1;
-    reasons.push('0 DTE (high risk)');
-  } else if (dteNum >= 30 && dteNum <= 60) {
-    score += 1;
-    reasons.push('Optimal DTE (30-60 days)');
+    score += 1.0;
+    reasons.push('0DTE (maximum urgency)');
+  } else if (dteNum <= 7) {
+    score += 0.75;
+    reasons.push('Weekly expiry (7d or less)');
+  } else if (dteNum <= 14) {
+    score += 0.5;
+    reasons.push('2-week expiry (14d or less)');
+  } else if (dteNum <= 30) {
+    score += 0.25;
+    reasons.push('Monthly expiry (30d or less)');
+  } else {
+    reasons.push(`DTE: ${dteNum}d (no boost)`);
   }
   
-  // Clamp score
+  // Round to 1 decimal
+  score = Math.round(score * 10) / 10;
+  
+  // Clamp to 0-10
   score = Math.max(0, Math.min(10, score));
   
   return {
     score,
     reasons,
-    isHighProbability: score >= 7 && trade.volume >= 100 && trade.openInterest >= 100 && premium >= 25000,
+    isHighProbability: score >= 7.0,
   };
 }
 
