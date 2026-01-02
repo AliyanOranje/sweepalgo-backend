@@ -12,6 +12,7 @@ import optionsQuotesRouter from './routes/optionsQuotes.js';
 import optionsIndicatorsRouter from './routes/optionsIndicators.js';
 import optionsMetadataRouter from './routes/optionsMetadata.js';
 import gexRouter from './routes/gex.js';
+import liveScannerRouter from './routes/liveScanner.js';
 
 dotenv.config();
 
@@ -86,6 +87,7 @@ app.use('/api/options/quotes', optionsQuotesRouter);
 app.use('/api/options/indicators', optionsIndicatorsRouter);
 app.use('/api/options/metadata', optionsMetadataRouter);
 app.use('/api/gex', gexRouter);
+app.use('/api/live-scanner', liveScannerRouter);
 
 // Options chain endpoint
 app.get('/api/options-chain/:ticker', async (req, res) => {
