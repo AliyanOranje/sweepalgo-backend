@@ -73,12 +73,13 @@ function daysToYears(days) {
 
 /**
  * Calculate Gamma Exposure for a single option
+ * ✅ CORRECT: Per guide - Uses spotPrice (NOT spotPrice²)
  */
 function calculateSingleGEX(gamma, openInterest, spotPrice, optionType) {
-  // GEX = Gamma × OI × 100 × SpotPrice²
+  // ✅ CORRECT: GEX = Gamma × OI × 100 × SpotPrice (NOT squared)
   // Calls are positive, puts are negative for market makers
   const multiplier = optionType === 'call' ? 1 : -1;
-  return gamma * openInterest * 100 * Math.pow(spotPrice, 2) * multiplier;
+  return gamma * openInterest * 100 * spotPrice * multiplier;
 }
 
 /**
@@ -146,9 +147,11 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
       spotPrice
     );
     
+    // ✅ CORRECT: Store both absolute value (for sorting) and netGEX (for filtering)
     gexByStrike.push({
       strike: option.strike,
-      gex: Math.abs(netGEX)
+      gex: Math.abs(netGEX),    // For sorting by magnitude
+      netGEX: netGEX            // Keep sign for filtering
     });
   });
   
@@ -161,22 +164,32 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
     };
   }
   
-  // Find gamma wall (highest absolute GEX)
-  const gammaWall = gexByStrike.reduce((max, current) => 
+  // ✅ CORRECT: Find gamma wall (highest ABSOLUTE GEX, regardless of sign)
+  const gammaWallData = gexByStrike.reduce((max, current) => 
     current.gex > max.gex ? current : max
   );
   
-  // Find support levels (high GEX below spot)
-  const support = gexByStrike
-    .filter(item => item.strike < spotPrice)
-    .sort((a, b) => b.gex - a.gex)
-    .slice(0, 3);
+  const gammaWall = {
+    strike: gammaWallData.strike,
+    gex: gammaWallData.gex,
+    isPositive: gammaWallData.netGEX > 0
+  };
   
-  // Find resistance levels (high GEX above spot)
-  const resistance = gexByStrike
-    .filter(item => item.strike > spotPrice)
+  // ✅ CORRECT: Support = HIGH POSITIVE GEX BELOW spot price
+  // (Market makers will buy dips, creating support)
+  const support = gexByStrike
+    .filter(item => item.strike < spotPrice && item.netGEX > 0)
     .sort((a, b) => b.gex - a.gex)
-    .slice(0, 3);
+    .slice(0, 3)
+    .map(item => ({ strike: item.strike, gex: item.gex }));
+  
+  // ✅ CORRECT: Resistance = HIGH POSITIVE GEX ABOVE spot price
+  // (Market makers will sell rallies, creating resistance)
+  const resistance = gexByStrike
+    .filter(item => item.strike > spotPrice && item.netGEX > 0)
+    .sort((a, b) => b.gex - a.gex)
+    .slice(0, 3)
+    .map(item => ({ strike: item.strike, gex: item.gex }));
   
   // Calculate max pain
   const maxPain = calculateMaxPain(optionsChain, spotPrice);
@@ -195,27 +208,30 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
 function calculateMaxPain(optionsChain, spotPrice) {
   if (optionsChain.length === 0) return null;
   
-  let minPain = Infinity;
-  let maxPainStrike = optionsChain[0].strike;
+  // ✅ CORRECT: Get unique strikes
+  const strikes = [...new Set(optionsChain.map(o => o.strike))];
   
-  optionsChain.forEach(testStrike => {
+  let minPain = Infinity;
+  let maxPainStrike = strikes[0];
+  
+  strikes.forEach(testStrike => {
     let totalPain = 0;
     
     optionsChain.forEach(option => {
-      // Calculate pain for calls
-      if (testStrike.strike > option.strike) {
-        totalPain += (testStrike.strike - option.strike) * option.callOI;
+      // Calculate pain for calls (ITM when strike < test)
+      if (testStrike > option.strike) {
+        totalPain += (testStrike - option.strike) * option.callOI;
       }
       
-      // Calculate pain for puts
-      if (testStrike.strike < option.strike) {
-        totalPain += (option.strike - testStrike.strike) * option.putOI;
+      // Calculate pain for puts (ITM when strike > test)
+      if (testStrike < option.strike) {
+        totalPain += (option.strike - testStrike) * option.putOI;
       }
     });
     
     if (totalPain < minPain) {
       minPain = totalPain;
-      maxPainStrike = testStrike.strike;
+      maxPainStrike = testStrike;
     }
   });
   
@@ -536,12 +552,13 @@ router.get('/:ticker', async (req, res) => {
     });
     
     // Find gamma flip point
+    // ✅ CORRECT: Use spotPrice (NOT squared) for reverse calculation
     const gammaFlip = findGammaFlip(
       Object.values(gexByExpiration)
         .flatMap(expData => expData.strikes.map(s => ({
           strike: s.strike,
-          callGamma: s.callGEX / (s.callOI * 100 * Math.pow(spotPrice, 2)) || 0,
-          putGamma: s.putGEX / (s.putOI * 100 * Math.pow(spotPrice, 2)) || 0,
+          callGamma: s.callOI > 0 ? s.callGEX / (s.callOI * 100 * spotPrice) : 0,
+          putGamma: s.putOI > 0 ? s.putGEX / (s.putOI * 100 * spotPrice) : 0,
           callOI: s.callOI,
           putOI: s.putOI,
         }))),
