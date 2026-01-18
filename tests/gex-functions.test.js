@@ -5,15 +5,17 @@
 
 import { describe, test, expect } from '@jest/globals';
 
-// Since functions are not exported, we'll test the logic directly
 // These tests verify the mathematical correctness of the formulas
+// Using INDUSTRY STANDARD formula: gamma × OI × 100 × spot² × 0.01
 
 describe('GEX Calculation Functions', () => {
   
-  // Helper function to replicate calculateSingleGEX
+  const PERCENT_MOVE = 0.01; // Industry standard: normalize to 1% price move
+  
+  // Helper function to replicate calculateSingleGEX (INDUSTRY STANDARD)
   function calculateSingleGEX(gamma, openInterest, spotPrice, optionType) {
     const multiplier = optionType === 'call' ? 1 : -1;
-    return gamma * openInterest * 100 * spotPrice * multiplier;
+    return gamma * openInterest * 100 * spotPrice * spotPrice * PERCENT_MOVE * multiplier;
   }
   
   // Helper function to replicate calculateStrikeGEX
@@ -29,38 +31,40 @@ describe('GEX Calculation Functions', () => {
     };
   }
   
-  describe('Bug #1: GEX Formula - spotPrice NOT squared', () => {
-    test('should use spotPrice, not spotPrice²', () => {
-      const gamma = 0.015;
-      const openInterest = 5000;
-      const spotPrice = 613.69;
+  describe('Bug #1: GEX Formula - MUST use spotPrice² × 0.01', () => {
+    test('should use spotPrice² × 0.01 (industry standard)', () => {
+      // Test data from BullFlow/DEVELOPER_HANDOFF.md
+      const gamma = 0.228;
+      const openInterest = 14500;
+      const spotPrice = 693.77;
       
-      // ✅ CORRECT formula
+      // ✅ CORRECT INDUSTRY STANDARD formula
       const correctGEX = calculateSingleGEX(gamma, openInterest, spotPrice, 'call');
       
-      // ❌ WRONG formula (what it was before)
-      const wrongGEX = gamma * openInterest * 100 * Math.pow(spotPrice, 2) * 1;
+      // ❌ WRONG formula (old implementation without spot² × 0.01)
+      const wrongGEX = gamma * openInterest * 100 * spotPrice * 1;
       
-      // Expected: ~$4.6M (0.015 * 5000 * 100 * 613.69 = 4,602,675)
-      expect(correctGEX).toBeGreaterThan(4500000);
-      expect(correctGEX).toBeLessThan(4700000);
+      // Expected: ~$1.59B (matches BullFlow)
+      expect(correctGEX).toBeGreaterThan(1500000000); // > $1.5B
+      expect(correctGEX).toBeLessThan(1700000000);    // < $1.7B
       
-      // Wrong formula would give ~$2.82B (600x too large)
-      expect(wrongGEX).toBeGreaterThan(2800000000);
-      
-      // Verify correct formula is NOT 600x larger
-      expect(correctGEX * 600).toBeLessThan(wrongGEX);
+      // Wrong formula would give ~$229M (about 7x too low)
+      expect(wrongGEX).toBeGreaterThan(200000000);
+      expect(wrongGEX).toBeLessThan(250000000);
     });
     
-    test('should match guide example', () => {
-      const gamma = 0.015;
-      const openInterest = 5000;
-      const spotPrice = 613.69;
+    test('should match BullFlow example', () => {
+      const gamma = 0.228;
+      const openInterest = 14500;
+      const spotPrice = 693.77;
       
       const gex = calculateSingleGEX(gamma, openInterest, spotPrice, 'call');
-      const expected = 4602675; // 0.015 * 5000 * 100 * 613.69 = 4,602,675
+      // Expected: 0.228 × 14,500 × 100 × 693.77² × 0.01 ≈ $1.59B
+      const expected = 1590000000;
       
-      expect(gex).toBeCloseTo(expected, 0);
+      // Should be within 1% of expected
+      const diff = Math.abs(gex - expected) / expected;
+      expect(diff).toBeLessThan(0.01);
     });
   });
   
@@ -78,6 +82,10 @@ describe('GEX Calculation Functions', () => {
       // Should be negative (more put GEX)
       expect(result.netGEX).toBeLessThan(0);
       expect(Math.abs(result.putGEX)).toBeGreaterThan(Math.abs(result.callGEX));
+      
+      // Verify values are in billions range with correct formula
+      expect(Math.abs(result.callGEX)).toBeGreaterThan(100000000); // > $100M
+      expect(Math.abs(result.putGEX)).toBeGreaterThan(500000000);  // > $500M
     });
     
     test('should calculate positive netGEX for call-dominated strikes', () => {
@@ -95,13 +103,17 @@ describe('GEX Calculation Functions', () => {
     });
     
     test('callGEX should always be positive, putGEX always negative', () => {
-      const spotPrice = 613.69;
+      const spotPrice = 693.77;
       
       const callGEX = calculateSingleGEX(0.01, 1000, spotPrice, 'call');
       const putGEX = calculateSingleGEX(0.01, 1000, spotPrice, 'put');
       
       expect(callGEX).toBeGreaterThan(0);
       expect(putGEX).toBeLessThan(0);
+      
+      // Verify magnitude with correct formula (should be ~$48M each)
+      expect(Math.abs(callGEX)).toBeGreaterThan(40000000);
+      expect(Math.abs(putGEX)).toBeGreaterThan(40000000);
     });
   });
   
