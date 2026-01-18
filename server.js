@@ -89,6 +89,153 @@ app.use('/api/options/metadata', optionsMetadataRouter);
 app.use('/api/gex', gexRouter);
 app.use('/api/live-scanner', liveScannerRouter);
 
+// Stock ticker info endpoint - fetches company details and price data using Massive.com API
+app.get('/api/stock/:ticker/info', async (req, res) => {
+  try {
+    const { ticker } = req.params;
+    const axios = (await import('axios')).default;
+    const apiKey = process.env.POLYGON_API_KEY;
+    
+    console.log(`📡 Fetching stock info for ${ticker}...`);
+    
+    // Fetch ticker details, previous close, and snapshot in parallel
+    const [tickerDetailsRes, prevCloseRes, snapshotRes] = await Promise.all([
+      // Get company info (name, exchange, industry, market cap) - Massive.com API
+      axios.get(`https://api.massive.com/v3/reference/tickers/${ticker.toUpperCase()}`, {
+        params: { apiKey }
+      }).catch(err => {
+        console.warn(`⚠️ Could not fetch ticker details: ${err.message}`);
+        return null;
+      }),
+      // Get previous close for price change calculation
+      axios.get(`https://api.massive.com/v2/aggs/ticker/${ticker.toUpperCase()}/prev`, {
+        params: { adjusted: true, apiKey }
+      }).catch(err => {
+        console.warn(`⚠️ Could not fetch prev close: ${err.message}`);
+        return null;
+      }),
+      // Get stock snapshot for real-time data including today's change
+      axios.get(`https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, {
+        params: { apiKey }
+      }).catch(err => {
+        console.warn(`⚠️ Could not fetch snapshot: ${err.message}`);
+        return null;
+      })
+    ]);
+
+    // Extract ticker details
+    const details = tickerDetailsRes?.data?.results || {};
+    const prevClose = prevCloseRes?.data?.results?.[0] || {};
+    const snapshot = snapshotRes?.data?.ticker || {};
+
+    console.log(`📊 Raw data for ${ticker}:`, {
+      hasDetails: !!tickerDetailsRes?.data?.results,
+      hasPrevClose: !!prevCloseRes?.data?.results?.[0],
+      hasSnapshot: !!snapshotRes?.data?.ticker,
+      detailsName: details.name,
+      prevClosePrice: prevClose.c,
+      snapshotData: snapshot
+    });
+
+    // Format market cap
+    const formatMarketCap = (value) => {
+      if (!value) return 'N/A';
+      if (value >= 1e12) return `$${(value / 1e12).toFixed(2)}T`;
+      if (value >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+      if (value >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
+      return `$${value.toLocaleString()}`;
+    };
+
+    // Simplify industry from SIC description
+    const simplifyIndustry = (sicDescription, type) => {
+      if (!sicDescription) {
+        if (type === 'ETF') return 'ETF';
+        return 'UNKNOWN';
+      }
+      const desc = sicDescription.toUpperCase();
+      if (desc.includes('SOFTWARE')) return 'SOFTWARE';
+      if (desc.includes('SEMICONDUCTOR')) return 'SEMICONDUCTORS';
+      if (desc.includes('COMPUTER') && desc.includes('STORAGE')) return 'DATA STORAGE';
+      if (desc.includes('COMPUTER')) return 'TECHNOLOGY';
+      if (desc.includes('ELECTRONIC')) return 'ELECTRONICS';
+      if (desc.includes('RETAIL')) return 'RETAIL';
+      if (desc.includes('MOTOR VEHICLE')) return 'AUTOMOTIVE';
+      if (desc.includes('PHARMACEUTICAL')) return 'PHARMACEUTICALS';
+      if (desc.includes('BANK')) return 'BANKING';
+      if (desc.includes('INSURANCE')) return 'INSURANCE';
+      if (desc.includes('OIL') || desc.includes('GAS')) return 'ENERGY';
+      if (desc.includes('TELECOMMUNICATION')) return 'TELECOM';
+      if (desc.includes('AEROSPACE')) return 'AEROSPACE';
+      if (desc.includes('FOOD')) return 'FOOD & BEVERAGE';
+      if (desc.includes('SERVICES')) return 'SERVICES';
+      return sicDescription.split(' ').slice(0, 2).join(' ').toUpperCase();
+    };
+
+    // Get price data from snapshot (most accurate for real-time)
+    // Snapshot has: day (today's OHLCV), prevDay (yesterday's OHLCV), todaysChange, todaysChangePerc
+    const todaysChange = snapshot.todaysChange || 0;
+    const todaysChangePerc = snapshot.todaysChangePerc || 0;
+    const currentPrice = snapshot.day?.c || snapshot.lastTrade?.p || prevClose.c || 0;
+    const previousClose = snapshot.prevDay?.c || prevClose.c || 0;
+
+    const responseData = {
+      success: true,
+      ticker: ticker.toUpperCase(),
+      name: details.name || ticker.toUpperCase(),
+      exchange: details.primary_exchange || 'UNKNOWN',
+      industry: simplifyIndustry(details.sic_description, details.type),
+      type: details.type || 'STOCK',
+      marketCap: formatMarketCap(details.market_cap),
+      marketCapRaw: details.market_cap || null,
+      // Price data - prefer snapshot for real-time accuracy
+      price: currentPrice,
+      open: snapshot.day?.o || prevClose.o || 0,
+      high: snapshot.day?.h || prevClose.h || 0,
+      low: snapshot.day?.l || prevClose.l || 0,
+      close: currentPrice,
+      volume: snapshot.day?.v || prevClose.v || 0,
+      prevClose: previousClose,
+      // Today's change (from snapshot if available)
+      todaysChange: todaysChange,
+      todaysChangePerc: todaysChangePerc,
+      // Additional info
+      homepageUrl: details.homepage_url || null,
+      totalEmployees: details.total_employees || null,
+      listDate: details.list_date || null,
+    };
+
+    console.log(`✅ Stock info fetched for ${ticker}:`, {
+      name: responseData.name,
+      exchange: responseData.exchange,
+      industry: responseData.industry,
+      marketCap: responseData.marketCap,
+      price: responseData.price,
+      prevClose: responseData.prevClose,
+      change: responseData.todaysChange,
+      changePerc: responseData.todaysChangePerc
+    });
+
+    res.json(responseData);
+  } catch (error) {
+    console.error(`❌ Error fetching stock info for ${req.params.ticker}:`, error.message);
+    res.status(500).json({
+      success: false,
+      ticker: req.params.ticker.toUpperCase(),
+      error: 'Failed to fetch stock info',
+      message: error.message,
+      // Return fallback data
+      name: req.params.ticker.toUpperCase(),
+      exchange: 'UNKNOWN',
+      industry: 'UNKNOWN',
+      marketCap: 'N/A',
+      price: 0,
+      prevClose: 0,
+      todaysChange: 0,
+      todaysChangePerc: 0,
+    });
+  }
+});
+
 // Options chain endpoint
 app.get('/api/options-chain/:ticker', async (req, res) => {
   try {
