@@ -85,17 +85,17 @@ function daysToYears(days) {
  * Example (SPY @ $693.77, gamma=0.228, OI=14,500):
  *   GEX = 0.228 × 14,500 × 100 × 693.77² × 0.01 = $1.59B
  * 
- * CRITICAL: Sign Convention from DEALER'S perspective (they are SHORT options):
- * - Calls: NEGATIVE (dealers are SHORT calls = SHORT gamma)
- * - Puts: POSITIVE (dealers are SHORT puts = LONG gamma)
+ * CRITICAL: Sign Convention (INDUSTRY STANDARD - matches BullFlow/SpotGamma):
+ * - Calls: POSITIVE GEX (+1) - Green - Support level - Dampens volatility
+ * - Puts: NEGATIVE GEX (-1) - Red - Resistance level - Amplifies volatility
  * 
  * This matches BullFlow's display where:
- * - Strikes below spot (put-heavy) show POSITIVE GEX (green)
- * - Strikes above spot (call-heavy) can show NEGATIVE GEX (red) if calls dominate
+ * - Call-heavy strikes show POSITIVE GEX (green) 
+ * - Put-heavy strikes show NEGATIVE GEX (red)
  */
 function calculateSingleGEX(gamma, openInterest, spotPrice, optionType) {
-  // DEALER PERSPECTIVE: Short calls = short gamma (-), Short puts = long gamma (+)
-  const multiplier = optionType === 'call' ? -1 : 1;
+  // INDUSTRY STANDARD: Calls = positive (+1), Puts = negative (-1)
+  const multiplier = optionType === 'call' ? 1 : -1;
   const PERCENT_MOVE = 0.01; // Industry standard: normalize to 1% price move
   return gamma * openInterest * 100 * spotPrice * spotPrice * PERCENT_MOVE * multiplier;
 }
@@ -457,10 +457,10 @@ router.get('/:ticker', async (req, res) => {
         }
         
         // CRITICAL: netGEX = callGEX + putGEX
-        // From DEALER perspective (they are SHORT options):
-        // - callGEX is NEGATIVE (dealers short calls = short gamma)
-        // - putGEX is POSITIVE (dealers short puts = long gamma)
-        // Net GEX = negative call exposure + positive put exposure
+        // INDUSTRY STANDARD sign convention (matches BullFlow/SpotGamma):
+        // - callGEX is POSITIVE (green, support, dampens volatility)
+        // - putGEX is NEGATIVE (red, resistance, amplifies volatility)
+        // Net GEX = positive call exposure + negative put exposure
         const netGEX = callGEX + putGEX;
         
         // Debug logging for key strikes near spot price
@@ -623,9 +623,10 @@ router.get('/:ticker', async (req, res) => {
     
     // Find gamma flip point using AGGREGATED GEX data
     // Gamma flip = price level where net GEX transitions from positive to negative
-    // POSITIVE GEX (below flip): Dealers long gamma = stabilizing (buy dips, sell rallies)
-    // NEGATIVE GEX (above flip): Dealers short gamma = destabilizing (sell dips, buy rallies)
-    // Typically: Put-heavy strikes below spot = positive, Call-heavy strikes above = can be negative
+    // INDUSTRY STANDARD (matches BullFlow/SpotGamma):
+    // - POSITIVE GEX (green): Call-heavy strikes = support = dampens volatility
+    // - NEGATIVE GEX (red): Put-heavy strikes = resistance = amplifies volatility
+    // Gamma flip point is where net GEX changes sign (transition between support/resistance zones)
     
     // Sort aggregated strikes by strike price (ascending)
     const sortedStrikes = aggregatedStrikesList.sort((a, b) => a.strike - b.strike);
