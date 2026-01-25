@@ -203,46 +203,64 @@ async function createNewUser(customerData, orderData) {
   
   console.log(`✅ User record created in database`);
   
-  // Step 3: Generate password reset link and send welcome email
+  // Step 3: Send password setup email to the new user
+  // IMPORTANT: Use Supabase's built-in email first (works for any email address)
+  // Only fall back to custom email if Supabase fails
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-  let passwordSetUrl = `${frontendUrl}/set-password?welcome=true`;
+  let emailSent = false;
+  
+  console.log(`📧 Sending password setup email to ${email}...`);
   
   try {
-    // Generate a password recovery link using Supabase Admin
-    const { data: linkData, error: resetError } = await getSupabaseAdmin().auth.admin.generateLink({
-      type: 'recovery',
-      email: email,
-      options: {
-        redirectTo: `${frontendUrl}/set-password?welcome=true`,
-      },
+    // PRIMARY METHOD: Use Supabase's built-in resetPasswordForEmail
+    // This works for ANY email address and doesn't require domain verification
+    const { error: supabaseEmailError } = await getSupabaseAdmin().auth.resetPasswordForEmail(email, {
+      redirectTo: `${frontendUrl}/set-password?welcome=true`,
     });
     
-    if (resetError) {
-      console.error('⚠️ Warning: Failed to generate password reset link:', resetError);
-    } else if (linkData?.properties?.action_link) {
-      // Use the actual Supabase-generated link
-      passwordSetUrl = linkData.properties.action_link;
-      console.log('✅ Password reset link generated:', passwordSetUrl.substring(0, 50) + '...');
+    if (supabaseEmailError) {
+      console.error('⚠️ Supabase email failed:', supabaseEmailError.message);
+      
+      // FALLBACK: Try custom email service (Resend)
+      // This only works if you have a verified domain in Resend
+      console.log('📧 Trying custom email service as fallback...');
+      
+      try {
+        const { data: linkData, error: linkError } = await getSupabaseAdmin().auth.admin.generateLink({
+          type: 'recovery',
+          email: email,
+          options: {
+            redirectTo: `${frontendUrl}/set-password?welcome=true`,
+          },
+        });
+        
+        if (!linkError && linkData?.properties?.action_link) {
+          await sendWelcomeEmail({
+            email,
+            firstName,
+            subscriptionTier,
+            redirectUrl: linkData.properties.action_link,
+          });
+          emailSent = true;
+          console.log(`✅ Custom welcome email sent to ${email}`);
+        } else {
+          console.error('⚠️ Failed to generate link:', linkError?.message);
+        }
+      } catch (customEmailError) {
+        console.error('⚠️ Custom email also failed:', customEmailError.message);
+      }
     } else {
-      console.log('⚠️ No action_link in response, using fallback URL');
+      emailSent = true;
+      console.log(`✅ Password reset email sent via Supabase to ${email}`);
     }
-  } catch (linkErr) {
-    console.error('⚠️ Warning: Error generating password reset link:', linkErr.message);
+    
+  } catch (err) {
+    console.error('⚠️ Error in email sending process:', err.message);
   }
   
-  // Step 4: Send welcome email with the password setup link
-  try {
-    await sendWelcomeEmail({
-      email,
-      firstName,
-      subscriptionTier,
-      redirectUrl: passwordSetUrl,
-    });
-    console.log(`✅ Welcome email sent to ${email}`);
-  } catch (emailError) {
-    console.error('⚠️ Warning: Failed to send welcome email:', emailError.message);
-    console.error('Email error details:', emailError);
-    // Don't throw - user account was created successfully
+  console.log(`📧 Email sent status: ${emailSent ? 'SUCCESS' : 'FAILED'}`);
+  if (!emailSent) {
+    console.log('⚠️ User will need to request password reset from login page');
   }
   
   return {
