@@ -138,57 +138,53 @@ router.post('/resend-password-reset', async (req, res) => {
       });
     }
     
+    const normalizedEmail = email.toLowerCase().trim();
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    
+    console.log(`📧 Password reset requested for: ${normalizedEmail}`);
+    console.log(`📧 Frontend URL: ${frontendUrl}`);
+    
     // Check if user exists in users table (only paid users have records here)
     const { data: user, error: lookupError } = await getSupabaseAdmin()
       .from('users')
       .select('id, first_name, email')
-      .eq('email', email.toLowerCase())
+      .eq('email', normalizedEmail)
       .single();
     
     if (lookupError || !user) {
-      // Don't reveal whether email exists
+      console.log(`⚠️ User not found in database: ${normalizedEmail}`);
+      // Don't reveal whether email exists - return success anyway
       return res.json({
         success: true,
         message: 'If an account exists with this email, a password reset link will be sent.',
       });
     }
     
-    // Generate password reset link using Supabase Admin
-    const { data, error: linkError } = await getSupabaseAdmin().auth.admin.generateLink({
-      type: 'recovery',
-      email: email.toLowerCase(),
-      options: {
-        redirectTo: `${process.env.FRONTEND_URL}/set-password`,
-      },
+    console.log(`✅ User found: ${user.first_name} (${normalizedEmail})`);
+    
+    // Use Supabase's built-in resetPasswordForEmail
+    // This sends the email directly through Supabase (works for ANY email address)
+    const { error: resetError } = await getSupabaseAdmin().auth.resetPasswordForEmail(normalizedEmail, {
+      redirectTo: `${frontendUrl}/set-password`,
     });
     
-    if (linkError) {
-      console.error('Error generating password reset link:', linkError);
+    if (resetError) {
+      console.error('❌ Error sending password reset email:', resetError);
       return res.status(500).json({
         success: false,
-        error: 'Failed to generate password reset link',
+        error: 'Failed to send password reset email. Please try again.',
       });
     }
     
-    // Send password reset email
-    try {
-      await sendPasswordResetEmail({
-        email: email.toLowerCase(),
-        firstName: user.first_name,
-        resetUrl: data.properties.action_link,
-      });
-    } catch (emailError) {
-      console.error('Error sending password reset email:', emailError);
-      // Don't fail the request - link was generated
-    }
+    console.log(`✅ Password reset email sent to ${normalizedEmail}`);
     
     return res.json({
       success: true,
-      message: 'If an account exists with this email, a password reset link will be sent.',
+      message: 'Password reset link has been sent to your email.',
     });
     
   } catch (error) {
-    console.error('Error in /api/auth/resend-password-reset:', error);
+    console.error('❌ Error in /api/auth/resend-password-reset:', error);
     return res.status(500).json({
       success: false,
       error: 'Internal server error',
