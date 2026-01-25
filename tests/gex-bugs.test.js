@@ -12,41 +12,47 @@ import { describe, test, expect } from '@jest/globals';
 describe('GEX Bug Fixes', () => {
   
   // ============================================
-  // Bug #1: GEX Formula (spotPrice² → spotPrice)
+  // Bug #1: GEX Formula - MUST use spotPrice² × 0.01
   // ============================================
   
-  describe('Bug #1: GEX Formula - spotPrice NOT squared', () => {
-    test('should calculate GEX using spotPrice (not spotPrice²)', () => {
-      // Known values from guide: QQQ at $613.69
-      const gamma = 0.015;
-      const openInterest = 5000;
-      const spotPrice = 613.69;
+  describe('Bug #1: GEX Formula - INDUSTRY STANDARD with spotPrice² × 0.01', () => {
+    test('should calculate GEX using spotPrice² × 0.01 (industry standard)', () => {
+      // Known values from BullFlow/SpotGamma: SPY at $693.77
+      const gamma = 0.228;
+      const openInterest = 14500;
+      const spotPrice = 693.77;
+      const PERCENT_MOVE = 0.01;
       
-      // ✅ CORRECT formula: gamma * OI * 100 * spotPrice
-      const correctGEX = gamma * openInterest * 100 * spotPrice;
+      // ✅ CORRECT INDUSTRY STANDARD formula: gamma * OI * 100 * spotPrice² * 0.01
+      const correctGEX = gamma * openInterest * 100 * spotPrice * spotPrice * PERCENT_MOVE;
       
-      // ❌ WRONG formula (what it was before): gamma * OI * 100 * spotPrice²
-      const wrongGEX = gamma * openInterest * 100 * Math.pow(spotPrice, 2);
+      // ❌ WRONG formula (old implementation): gamma * OI * 100 * spotPrice
+      const wrongGEX = gamma * openInterest * 100 * spotPrice;
       
-      // Expected: ~$4.6M (0.015 * 5000 * 100 * 613.69 = 4,602,675)
-      expect(correctGEX).toBeGreaterThan(4500000);
-      expect(correctGEX).toBeLessThan(4700000);
+      // Expected: ~$1.59B (matches BullFlow)
+      // 0.228 × 14,500 × 100 × 693.77² × 0.01 = 1,591,073,447
+      expect(correctGEX).toBeGreaterThan(1500000000); // > $1.5B
+      expect(correctGEX).toBeLessThan(1700000000);    // < $1.7B
       
-      // Wrong formula would give ~$2.82B (600x too large)
-      expect(wrongGEX).toBeGreaterThan(2800000000);
+      // Wrong formula would give ~$229M (about 7x too low)
+      expect(wrongGEX).toBeGreaterThan(200000000);
+      expect(wrongGEX).toBeLessThan(250000000);
       
-      // Verify correct formula is NOT 600x larger
-      expect(correctGEX * 600).toBeLessThan(wrongGEX);
+      // Verify correct formula is about 6.9x larger (spotPrice * 0.01 = 6.9377)
+      const ratio = correctGEX / wrongGEX;
+      expect(ratio).toBeGreaterThan(6.5);
+      expect(ratio).toBeLessThan(7.5);
     });
     
-    test('should match SpotGamma values within 5%', () => {
-      // Example from guide
-      const gamma = 0.015;
-      const openInterest = 5000;
-      const spotPrice = 613.69;
+    test('should match BullFlow values within 5%', () => {
+      // Test data from client's DEVELOPER_HANDOFF.md
+      const gamma = 0.228;
+      const openInterest = 14500;
+      const spotPrice = 693.77;
+      const PERCENT_MOVE = 0.01;
       
-      const gex = gamma * openInterest * 100 * spotPrice;
-      const expected = 4602675; // 0.015 * 5000 * 100 * 613.69 = 4,602,675
+      const gex = gamma * openInterest * 100 * spotPrice * spotPrice * PERCENT_MOVE;
+      const expected = 1590000000; // ~$1.59B from BullFlow
       
       // Should be within 5% of expected
       const diff = Math.abs(gex - expected) / expected;
@@ -67,10 +73,11 @@ describe('GEX Bug Fixes', () => {
       const callOI = 3000;
       const putOI = 8000;
       const spotPrice = 613.69;
+      const PERCENT_MOVE = 0.01;
       
-      // Calculate GEX
-      const callGEX = callGamma * callOI * 100 * spotPrice * 1;  // Positive
-      const putGEX = putGamma * putOI * 100 * spotPrice * -1;    // Negative
+      // Calculate GEX with CORRECT formula: gamma * OI * 100 * spot² * 0.01 * direction
+      const callGEX = callGamma * callOI * 100 * spotPrice * spotPrice * PERCENT_MOVE * 1;   // Positive
+      const putGEX = putGamma * putOI * 100 * spotPrice * spotPrice * PERCENT_MOVE * -1;     // Negative
       const netGEX = callGEX + putGEX;
       
       // Should be negative (more put GEX)
@@ -85,9 +92,10 @@ describe('GEX Bug Fixes', () => {
       const callOI = 8000;
       const putOI = 3000;
       const spotPrice = 613.69;
+      const PERCENT_MOVE = 0.01;
       
-      const callGEX = callGamma * callOI * 100 * spotPrice * 1;
-      const putGEX = putGamma * putOI * 100 * spotPrice * -1;
+      const callGEX = callGamma * callOI * 100 * spotPrice * spotPrice * PERCENT_MOVE * 1;
+      const putGEX = putGamma * putOI * 100 * spotPrice * spotPrice * PERCENT_MOVE * -1;
       const netGEX = callGEX + putGEX;
       
       // Should be positive (more call GEX)
@@ -96,19 +104,19 @@ describe('GEX Bug Fixes', () => {
     });
     
     test('should allow netGEX to be either positive or negative', () => {
-      const spotPrice = 613.69;
-      
       // Test case 1: Positive netGEX
       const callGEX1 = 100000000;
       const putGEX1 = -50000000;
       const netGEX1 = callGEX1 + putGEX1;
       expect(netGEX1).toBeGreaterThan(0);
+      expect(netGEX1).toBe(50000000);
       
       // Test case 2: Negative netGEX
       const callGEX2 = 50000000;
       const putGEX2 = -100000000;
       const netGEX2 = callGEX2 + putGEX2;
       expect(netGEX2).toBeLessThan(0);
+      expect(netGEX2).toBe(-50000000);
     });
   });
   

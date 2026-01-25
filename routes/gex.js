@@ -73,13 +73,31 @@ function daysToYears(days) {
 
 /**
  * Calculate Gamma Exposure for a single option
- * ✅ CORRECT: Per guide - Uses spotPrice (NOT spotPrice²)
+ * 
+ * INDUSTRY STANDARD FORMULA (used by SpotGamma, BullFlow, SqueezeMetrics):
+ *   GEX = Gamma × OI × 100 × Spot² × 0.01 × Direction
+ * 
+ * WHY spot² × 0.01?
+ * - First spot: Converts gamma (per $1 move) to dollar delta
+ * - Second spot × 0.01: Scales to "1% move in price"
+ * - Result: "How much dealers hedge for 1% price move"
+ * 
+ * Example (SPY @ $693.77, gamma=0.228, OI=14,500):
+ *   GEX = 0.228 × 14,500 × 100 × 693.77² × 0.01 = $1.59B
+ * 
+ * CRITICAL: Sign Convention (INDUSTRY STANDARD - matches BullFlow/SpotGamma):
+ * - Calls: POSITIVE GEX (+1) - Green - Support level - Dampens volatility
+ * - Puts: NEGATIVE GEX (-1) - Red - Resistance level - Amplifies volatility
+ * 
+ * This matches BullFlow's display where:
+ * - Call-heavy strikes show POSITIVE GEX (green) 
+ * - Put-heavy strikes show NEGATIVE GEX (red)
  */
 function calculateSingleGEX(gamma, openInterest, spotPrice, optionType) {
-  // ✅ CORRECT: GEX = Gamma × OI × 100 × SpotPrice (NOT squared)
-  // Calls are positive, puts are negative for market makers
+  // INDUSTRY STANDARD: Calls = positive (+1), Puts = negative (-1)
   const multiplier = optionType === 'call' ? 1 : -1;
-  return gamma * openInterest * 100 * spotPrice * multiplier;
+  const PERCENT_MOVE = 0.01; // Industry standard: normalize to 1% price move
+  return gamma * openInterest * 100 * spotPrice * spotPrice * PERCENT_MOVE * multiplier;
 }
 
 /**
@@ -99,13 +117,17 @@ function calculateStrikeGEX(strike, callGamma, putGamma, callOI, putOI, spotPric
 
 /**
  * Find gamma flip point (zero gamma point)
+ * The price level where net gamma exposure crosses zero
  */
 function findGammaFlip(optionsChain, spotPrice) {
   let prevNetGEX = 0;
   let flipPoint = null;
   
-  for (let i = 0; i < optionsChain.length; i++) {
-    const option = optionsChain[i];
+  // Sort by strike to ensure proper traversal
+  const sortedChain = [...optionsChain].sort((a, b) => a.strike - b.strike);
+  
+  for (let i = 0; i < sortedChain.length; i++) {
+    const option = sortedChain[i];
     const { netGEX } = calculateStrikeGEX(
       option.strike,
       option.callGamma,
@@ -118,7 +140,7 @@ function findGammaFlip(optionsChain, spotPrice) {
     // Look for sign change
     if (prevNetGEX !== 0 && Math.sign(netGEX) !== Math.sign(prevNetGEX)) {
       // Interpolate exact flip point
-      const prevOption = optionsChain[i - 1];
+      const prevOption = sortedChain[i - 1];
       flipPoint = option.strike - 
         (netGEX / (netGEX - prevNetGEX)) * 
         (option.strike - prevOption.strike);
@@ -434,24 +456,23 @@ router.get('/:ticker', async (req, res) => {
           putGEX += singleGEX;
         }
         
-        // Calculate aggregate GEX at this strike
-        const avgCallGamma = callOI > 0 ? callGamma / callOI : 0;
-        const avgPutGamma = putOI > 0 ? putGamma / putOI : 0;
+        // CRITICAL: netGEX = callGEX + putGEX
+        // INDUSTRY STANDARD sign convention (matches BullFlow/SpotGamma):
+        // - callGEX is POSITIVE (green, support, dampens volatility)
+        // - putGEX is NEGATIVE (red, resistance, amplifies volatility)
+        // Net GEX = positive call exposure + negative put exposure
+        const netGEX = callGEX + putGEX;
         
-        const strikeGEXData = calculateStrikeGEX(
-          strikeNum,
-          avgCallGamma,
-          avgPutGamma,
-          callOI,
-          putOI,
-          spotPrice
-        );
+        // Debug logging for key strikes near spot price
+        if (Math.abs(strikeNum - spotPrice) < 20) {
+          console.log(`📊 [GEX Debug] ${ticker} Strike $${strikeNum} (${expDate}): callGEX=${(callGEX/1e6).toFixed(2)}M, putGEX=${(putGEX/1e6).toFixed(2)}M, netGEX=${(netGEX/1e6).toFixed(2)}M | callOI=${callOI}, putOI=${putOI}`);
+        }
         
         strikeGEX.push({
           strike: strikeNum,
-          callGEX: callGEX,
-          putGEX: putGEX,
-          netGEX: strikeGEXData.netGEX,
+          callGEX: callGEX,   // Positive value
+          putGEX: putGEX,     // Negative value (sign applied in calculateSingleGEX)
+          netGEX: netGEX,     // callGEX + putGEX (consistent!)
           callOI,
           putOI,
           totalOI: callOI + putOI,
@@ -476,34 +497,83 @@ router.get('/:ticker', async (req, res) => {
       };
     }
     
-    // Calculate key levels (gamma wall, support, resistance, max pain)
-    // CRITICAL: Use gamma directly from API, exclude contracts without gamma
+    // Calculate key levels using AGGREGATED GEX data (consistent with heatmap)
+    // First, aggregate GEX across ALL expirations for each strike
     const allContracts = Object.values(contractsByExpiration).flat();
-    const keyLevels = findKeyGEXLevels(
+    const aggregatedGEXByStrike = {};
+    
+    Object.values(gexByExpiration).forEach(expData => {
+      expData.strikes.forEach(s => {
+        if (!aggregatedGEXByStrike[s.strike]) {
+          aggregatedGEXByStrike[s.strike] = {
+            strike: s.strike,
+            netGEX: 0,
+            callGEX: 0,
+            putGEX: 0,
+            totalOI: 0,
+          };
+        }
+        aggregatedGEXByStrike[s.strike].netGEX += s.netGEX || 0;
+        aggregatedGEXByStrike[s.strike].callGEX += s.callGEX || 0;
+        aggregatedGEXByStrike[s.strike].putGEX += s.putGEX || 0;
+        aggregatedGEXByStrike[s.strike].totalOI += s.totalOI || 0;
+      });
+    });
+    
+    const aggregatedStrikesList = Object.values(aggregatedGEXByStrike);
+    
+    // Find gamma wall (strike with highest ABSOLUTE netGEX across all expirations)
+    const gammaWallData = aggregatedStrikesList.length > 0 
+      ? aggregatedStrikesList.reduce((max, curr) => 
+          Math.abs(curr.netGEX) > Math.abs(max.netGEX) ? curr : max
+        )
+      : null;
+    
+    // Find support levels: HIGH POSITIVE GEX strikes BELOW spot price
+    // (Market makers buy dips here, creating support)
+    const supportLevels = aggregatedStrikesList
+      .filter(s => s.strike < spotPrice && s.netGEX > 0)
+      .sort((a, b) => b.netGEX - a.netGEX) // Sort by netGEX descending
+      .slice(0, 3)
+      .map(s => ({ strike: s.strike, gex: s.netGEX }));
+    
+    // Find resistance levels: HIGH POSITIVE GEX strikes ABOVE spot price
+    // (Market makers sell rallies here, creating resistance)  
+    const resistanceLevels = aggregatedStrikesList
+      .filter(s => s.strike > spotPrice && s.netGEX > 0)
+      .sort((a, b) => b.netGEX - a.netGEX) // Sort by netGEX descending
+      .slice(0, 3)
+      .map(s => ({ strike: s.strike, gex: s.netGEX }));
+    
+    // Calculate max pain using raw contracts
+    const maxPainStrike = calculateMaxPain(
       allContracts
-        .filter(c => {
-          // Only include contracts with valid gamma
-          const gamma = c.greeks?.gamma;
-          return gamma !== null && gamma !== undefined && !isNaN(gamma);
-        })
+        .filter(c => c.greeks?.gamma !== null && c.greeks?.gamma !== undefined)
         .map(c => {
-          // Polygon.io uses details.strike_price and details.expiration_date
           const strike = parseFloat(c.details?.strike_price || c.strike_price || c.strike);
-          const gamma = c.greeks?.gamma || 0;
           const contractType = (c.details?.contract_type || c.contract_type || c.type || '').toLowerCase();
           const isCall = contractType === 'call' || contractType === 'c';
           const oi = c.open_interest || c.openInterest || c.oi || 0;
           
           return {
             strike,
-            callGamma: isCall ? gamma : 0,
-            putGamma: !isCall ? gamma : 0,
             callOI: isCall ? oi : 0,
             putOI: !isCall ? oi : 0,
           };
         }),
       spotPrice
     );
+    
+    const keyLevels = {
+      gammaWall: gammaWallData ? { 
+        strike: gammaWallData.strike, 
+        gex: Math.abs(gammaWallData.netGEX),
+        isPositive: gammaWallData.netGEX > 0
+      } : null,
+      support: supportLevels,
+      resistance: resistanceLevels,
+      maxPain: maxPainStrike
+    };
     
     // Calculate total net GEX and aggregate Greeks
     let totalNetGEX = 0;
@@ -551,19 +621,76 @@ router.get('/:ticker', async (req, res) => {
       totalGamma += gamma * oi * contractMultiplier;
     });
     
-    // Find gamma flip point
-    // ✅ CORRECT: Use spotPrice (NOT squared) for reverse calculation
-    const gammaFlip = findGammaFlip(
-      Object.values(gexByExpiration)
-        .flatMap(expData => expData.strikes.map(s => ({
-          strike: s.strike,
-          callGamma: s.callOI > 0 ? s.callGEX / (s.callOI * 100 * spotPrice) : 0,
-          putGamma: s.putOI > 0 ? s.putGEX / (s.putOI * 100 * spotPrice) : 0,
-          callOI: s.callOI,
-          putOI: s.putOI,
-        }))),
-      spotPrice
-    );
+    // Find gamma flip point using AGGREGATED GEX data
+    // Gamma flip = price level where net GEX transitions from positive to negative
+    // INDUSTRY STANDARD (matches BullFlow/SpotGamma):
+    // - POSITIVE GEX (green): Call-heavy strikes = support = dampens volatility
+    // - NEGATIVE GEX (red): Put-heavy strikes = resistance = amplifies volatility
+    // Gamma flip point is where net GEX changes sign (transition between support/resistance zones)
+    
+    // Sort aggregated strikes by strike price (ascending)
+    const sortedStrikes = aggregatedStrikesList.sort((a, b) => a.strike - b.strike);
+    
+    // Find all sign-change points (gamma flip candidates)
+    let gammaFlip = null;
+    const flipCandidates = [];
+    
+    for (let i = 1; i < sortedStrikes.length; i++) {
+      const prev = sortedStrikes[i - 1];
+      const curr = sortedStrikes[i];
+      
+      // Check for sign change in netGEX
+      if (prev.netGEX !== 0 && curr.netGEX !== 0 && Math.sign(prev.netGEX) !== Math.sign(curr.netGEX)) {
+        // Linear interpolation to find exact flip point
+        const flipPoint = prev.strike + 
+          (curr.strike - prev.strike) * 
+          Math.abs(prev.netGEX) / (Math.abs(prev.netGEX) + Math.abs(curr.netGEX));
+        
+        flipCandidates.push({
+          flipPoint,
+          prevStrike: prev.strike,
+          currStrike: curr.strike,
+          prevGEX: prev.netGEX,
+          currGEX: curr.netGEX,
+          isPositiveToNegative: prev.netGEX > 0 && curr.netGEX < 0
+        });
+      }
+    }
+    
+    // Select gamma flip: prefer positive-to-negative transition ABOVE spot price
+    // This matches BullFlow's convention
+    const flipAboveSpot = flipCandidates
+      .filter(f => f.flipPoint > spotPrice && f.isPositiveToNegative)
+      .sort((a, b) => a.flipPoint - b.flipPoint)[0];
+    
+    // Fallback: any flip above spot
+    const anyFlipAboveSpot = flipCandidates
+      .filter(f => f.flipPoint > spotPrice)
+      .sort((a, b) => a.flipPoint - b.flipPoint)[0];
+    
+    // Fallback: closest flip to spot
+    const closestFlip = flipCandidates
+      .sort((a, b) => Math.abs(a.flipPoint - spotPrice) - Math.abs(b.flipPoint - spotPrice))[0];
+    
+    gammaFlip = flipAboveSpot?.flipPoint || anyFlipAboveSpot?.flipPoint || closestFlip?.flipPoint || null;
+    
+    // Debug logging for aggregated GEX near spot
+    const nearSpotStrikes = sortedStrikes.filter(s => Math.abs(s.strike - spotPrice) < 25);
+    console.log(`\n📊 [GEX SUMMARY] ${ticker} @ $${spotPrice.toFixed(2)}`);
+    console.log(`📊 Aggregated GEX near spot (all expirations combined):`);
+    nearSpotStrikes.forEach(s => {
+      const sign = s.netGEX >= 0 ? '+' : '';
+      console.log(`   $${s.strike}: ${sign}${(s.netGEX/1e6).toFixed(2)}M (call: +${(s.callGEX/1e6).toFixed(2)}M, put: ${(s.putGEX/1e6).toFixed(2)}M)`);
+    });
+    
+    // Debug logging
+    console.log(`\n📊 [GEX] Found ${flipCandidates.length} flip candidates`);
+    if (flipCandidates.length > 0) {
+      console.log(`📊 [GEX] Flip candidates:`, flipCandidates.map(f => 
+        `$${f.flipPoint.toFixed(2)} (${f.isPositiveToNegative ? '+→-' : '-→+'})`
+      ).join(', '));
+    }
+    console.log(`📊 [GEX] Selected gamma flip: $${gammaFlip?.toFixed(2) || 'null'}`);
     
     // Prepare heatmap data
     // Sort expirations chronologically (earliest first for proper flow delta calculation)
