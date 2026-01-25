@@ -14,6 +14,7 @@
 
 import express from 'express';
 import crypto from 'crypto';
+import qs from 'qs';
 import { createClient } from '@supabase/supabase-js';
 import { sendWelcomeEmail } from '../services/emailService.js';
 
@@ -78,48 +79,30 @@ function getSubscriptionTier(productId) {
 }
 
 // ==========================================
-// WEBHOOK SIGNATURE VERIFICATION
+// WEBHOOK VERIFICATION (ThriveCart)
 // ==========================================
+// ThriveCart does NOT send an HMAC header. They include thrivecart_secret in
+// the POST body; it must match the "Secret word" from Settings > API & Webhooks
+// > ThriveCart order validation. See: https://support.thrivecart.com/help/using-webhook-notifications/
 
 /**
- * Verifies the ThriveCart webhook signature
- * IMPORTANT: This ensures the webhook came from ThriveCart, not an attacker
- * 
- * @param {string} payload - Raw request body
- * @param {string} signature - Signature from ThriveCart header
- * @returns {boolean} - Whether signature is valid
+ * Verifies the ThriveCart webhook using thrivecart_secret in the payload.
+ * @param {Object} payload - Parsed request body (after any thrivecart unwrapping)
+ * @returns {{ ok: boolean, reason?: string }}
  */
-function verifyWebhookSignature(payload, signature) {
-  // Use THRIVECART_ORDERVALID_SECRET for order validation
-  const webhookSecret = process.env.THRIVECART_ORDERVALID_SECRET || process.env.THRIVECART_WEBHOOK_SECRET;
-  
-  if (!webhookSecret) {
-    console.error('❌ THRIVECART_ORDERVALID_SECRET not configured');
-    return false;
+function verifyThriveCartWebhook(payload) {
+  const expected = process.env.THRIVECART_ORDERVALID_SECRET || process.env.THRIVECART_WEBHOOK_SECRET;
+  if (!expected) {
+    return { ok: false, reason: 'THRIVECART_ORDERVALID_SECRET not configured' };
   }
-  
-  if (!signature) {
-    console.error('❌ No signature provided in webhook request');
-    return false;
+  const received = (payload && (payload.thrivecart_secret || payload['thrivecart_secret'])) || '';
+  if (!received) {
+    return { ok: false, reason: 'thrivecart_secret missing in webhook body' };
   }
-  
-  // ThriveCart uses HMAC SHA256 for signature
-  const expectedSignature = crypto
-    .createHmac('sha256', webhookSecret)
-    .update(payload)
-    .digest('hex');
-  
-  // Use timing-safe comparison to prevent timing attacks
-  const isValid = crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
-  
-  if (!isValid) {
-    console.error('❌ Webhook signature verification failed');
+  if (received !== expected) {
+    return { ok: false, reason: 'thrivecart_secret does not match' };
   }
-  
-  return isValid;
+  return { ok: true };
 }
 
 // ==========================================
@@ -273,6 +256,7 @@ async function createNewUser(customerData, orderData) {
 
 /**
  * Updates an existing user's subscription
+ * Also sends a password reset link in case they need to set or reset their password.
  * 
  * @param {Object} existingUser - Existing user from database
  * @param {Object} orderData - Order data from ThriveCart
@@ -306,6 +290,21 @@ async function updateExistingUser(existingUser, orderData) {
   }
   
   console.log(`✅ User subscription updated to ${subscriptionTier}`);
+  
+  // Send password reset link (in case they forgot or need to set one)
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  try {
+    const { error: emailErr } = await getSupabaseAdmin().auth.resetPasswordForEmail(existingUser.email.toLowerCase(), {
+      redirectTo: `${frontendUrl}/set-password?welcome=true`,
+    });
+    if (emailErr) {
+      console.warn('⚠️ Could not send reset link to existing user:', emailErr.message);
+    } else {
+      console.log(`✅ Password reset link sent to ${existingUser.email}`);
+    }
+  } catch (e) {
+    console.warn('⚠️ Error sending reset link:', e.message);
+  }
   
   return {
     userId: existingUser.id,
@@ -415,10 +414,15 @@ async function handleOrderSuccess(payload) {
     ''
   ).toString();
   
+  // ThriveCart form can send subscriptions[product-2]=sub_xxx; take first value if object
+  const subsObj = payload.subscriptions && typeof payload.subscriptions === 'object' && !Array.isArray(payload.subscriptions)
+    ? Object.values(payload.subscriptions)[0]
+    : null;
   const subscriptionId = (
     payload.subscription_id || 
     payload.subscription?.id ||
     payload.rebill_id ||
+    subsObj ||
     ''
   ).toString();
   
@@ -813,6 +817,35 @@ async function handlePaymentFailed(payload) {
 }
 
 // ==========================================
+// RAW BODY MIDDLEWARE (for signature verification)
+// ==========================================
+// Must read raw body BEFORE any body parser. The webhook path is excluded from
+// express.json() in server.js so the stream is still available here.
+// We need the exact raw string for ThriveCart HMAC verification.
+
+function rawBodyWebhookMiddleware(req, res, next) {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    req.rawBody = Buffer.concat(chunks).toString('utf8');
+    const contentType = req.headers['content-type'] || '';
+    try {
+      if (contentType.includes('application/json') || (req.rawBody && req.rawBody.trim().startsWith('{'))) {
+        req.body = JSON.parse(req.rawBody || '{}');
+      } else {
+        // ThriveCart sends x-www-form-urlencoded with nested keys like customer[email], order[total].
+        // qs.parse produces nested objects so payload.customer.email and payload.order.total work.
+        req.body = qs.parse(req.rawBody || '', { allowDots: false, depth: 10 });
+      }
+    } catch (e) {
+      req.body = {};
+    }
+    next();
+  });
+  req.on('error', next);
+}
+
+// ==========================================
 // MAIN WEBHOOK ENDPOINT
 // ==========================================
 
@@ -823,69 +856,22 @@ async function handlePaymentFailed(payload) {
  * This endpoint must be registered in ThriveCart webhook settings.
  * 
  * Required environment variables:
- * - THRIVECART_WEBHOOK_SECRET: Secret for signature verification
+ * - THRIVECART_ORDERVALID_SECRET: Secret for signature verification
  * - SUPABASE_URL: Supabase project URL
  * - SUPABASE_SERVICE_ROLE_KEY: Supabase service role key (admin access)
  * - FRONTEND_URL: Frontend URL for email links
  */
-router.post('/webhook', express.urlencoded({ extended: true }), express.json(), async (req, res) => {
+router.post('/webhook', rawBodyWebhookMiddleware, async (req, res) => {
   console.log('\n========================================');
   console.log('📨 ThriveCart Webhook Received');
   console.log('========================================');
   
   const contentType = req.headers['content-type'] || '';
   console.log('📋 Content-Type:', contentType);
-  console.log('📋 Body Type:', typeof req.body);
+  console.log('📋 Raw body length:', (req.rawBody || '').length);
   
   try {
-    let payload;
-    let rawBody;
-    let parseMethod = 'unknown';
-    
-    // ThriveCart can send data as JSON or form-urlencoded
-    // Handle both formats robustly
-    
-    if (typeof req.body === 'string') {
-      // Raw string body - try JSON first, then URL-encoded
-      rawBody = req.body;
-      if (contentType.includes('application/json') || req.body.trim().startsWith('{')) {
-        try {
-          payload = JSON.parse(rawBody);
-          parseMethod = 'JSON (from string)';
-        } catch (e) {
-          // Fall back to URL-encoded
-          payload = Object.fromEntries(new URLSearchParams(rawBody));
-          parseMethod = 'URL-encoded (from string)';
-        }
-      } else {
-        payload = Object.fromEntries(new URLSearchParams(rawBody));
-        parseMethod = 'URL-encoded (from string)';
-      }
-    } else if (Buffer.isBuffer(req.body)) {
-      // Buffer body
-      rawBody = req.body.toString();
-      if (contentType.includes('application/json') || rawBody.trim().startsWith('{')) {
-        try {
-          payload = JSON.parse(rawBody);
-          parseMethod = 'JSON (from buffer)';
-        } catch (e) {
-          payload = Object.fromEntries(new URLSearchParams(rawBody));
-          parseMethod = 'URL-encoded (from buffer)';
-        }
-      } else {
-        payload = Object.fromEntries(new URLSearchParams(rawBody));
-        parseMethod = 'URL-encoded (from buffer)';
-      }
-    } else if (typeof req.body === 'object' && req.body !== null) {
-      // Already parsed by express middleware (JSON or urlencoded)
-      payload = req.body;
-      rawBody = JSON.stringify(req.body);
-      parseMethod = contentType.includes('application/json') ? 'JSON (pre-parsed)' : 'URL-encoded (pre-parsed)';
-    } else {
-      throw new Error('Unable to parse webhook body - unexpected body type');
-    }
-    
-    console.log('📋 Parse Method:', parseMethod);
+    let payload = req.body || {};
     
     // ThriveCart may wrap data in thrivecart[...] format when form-urlencoded
     // Also handle nested JSON strings
@@ -914,20 +900,20 @@ router.post('/webhook', express.urlencoded({ extended: true }), express.json(), 
     
     console.log('📦 Final Parsed Payload:', JSON.stringify(payload, null, 2));
     
-    const signature = req.headers['x-thrivecart-signature'] || req.headers['thrivecart-signature'] || req.headers['x-tc-signature'];
-    
-    // Verify webhook signature
+    // ThriveCart verification: thrivecart_secret in body must match THRIVECART_ORDERVALID_SECRET
     if (process.env.NODE_ENV === 'production') {
-      if (!verifyWebhookSignature(rawBody, signature)) {
-        console.error('❌ Webhook signature verification failed');
+      const verification = verifyThriveCartWebhook(payload);
+      if (!verification.ok) {
+        console.error('❌ Webhook verification failed:', verification.reason);
         return res.status(401).json({
           success: false,
-          error: 'Invalid webhook signature',
+          error: 'Invalid webhook verification',
+          reason: verification.reason,
         });
       }
-      console.log('✅ Webhook signature verified');
+      console.log('✅ Webhook thrivecart_secret verified');
     } else {
-      console.log('⚠️ Development mode: Skipping signature verification');
+      console.log('⚠️ Development mode: Skipping thrivecart_secret verification');
     }
     
     // Get the event type
@@ -951,16 +937,19 @@ router.post('/webhook', express.urlencoded({ extended: true }), express.json(), 
         
       case 'subscription.cancelled':
       case 'subscription.canceled':
+      case 'order.subscription_cancelled':
         result = await handleSubscriptionCancelled(payload);
         break;
         
       case 'subscription.renewed':
       case 'subscription.renewal':
+      case 'order.subscription_payment':
         result = await handleSubscriptionRenewed(payload);
         break;
         
       case 'subscription.payment_failed':
       case 'subscription.failed':
+      case 'order.rebill_failed':
         result = await handlePaymentFailed(payload);
         break;
         
@@ -1023,10 +1012,9 @@ router.get('/', (req, res) => {
 });
 
 /**
- * POST to root - redirect to webhook handler
+ * POST to root - forward to webhook handler (no body parsers; /webhook reads raw body)
  */
-router.post('/', express.urlencoded({ extended: true }), express.json(), async (req, res, next) => {
-  // Forward to the main webhook handler
+router.post('/', (req, res, next) => {
   req.url = '/webhook';
   router.handle(req, res, next);
 });

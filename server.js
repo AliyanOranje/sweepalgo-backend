@@ -60,8 +60,14 @@ app.use(cors({
 }));
 
 // Parse JSON for API routes
-// Note: ThriveCart webhook handles its own body parsing
-app.use(express.json());
+// SKIP body parsing for ThriveCart webhook - it needs the raw body for signature verification
+app.use((req, res, next) => {
+  const path = (req.originalUrl || req.url || '').split('?')[0];
+  if (path.startsWith('/api/thrivecart') || path.startsWith('/webhook')) {
+    return next();
+  }
+  express.json()(req, res, next);
+});
 
 // Log environment configuration
 console.log('🔧 Backend Configuration:', {
