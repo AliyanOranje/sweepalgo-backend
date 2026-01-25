@@ -13,6 +13,8 @@ import optionsIndicatorsRouter from './routes/optionsIndicators.js';
 import optionsMetadataRouter from './routes/optionsMetadata.js';
 import gexRouter from './routes/gex.js';
 import liveScannerRouter from './routes/liveScanner.js';
+import thrivecartWebhookRouter from './routes/thrivecartWebhook.js';
+import authRouter from './routes/auth.js';
 
 dotenv.config();
 
@@ -57,6 +59,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// Parse JSON for API routes
+// Note: ThriveCart webhook handles its own body parsing
 app.use(express.json());
 
 // Log environment configuration
@@ -66,6 +70,10 @@ console.log('🔧 Backend Configuration:', {
   frontendUrl: process.env.FRONTEND_URL || 'Not set (using localhost)',
   allowedOrigins: allowedOrigins,
   polygonApiKey: process.env.POLYGON_API_KEY ? '✅ Set' : '❌ Missing',
+  supabaseUrl: process.env.SUPABASE_URL ? '✅ Set' : '❌ Missing',
+  supabaseServiceRole: process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Set' : '❌ Missing',
+  thrivecartOrderValidSecret: process.env.THRIVECART_ORDERVALID_SECRET ? '✅ Set' : '❌ Missing',
+  thrivecartApi: process.env.THRIVECART_API ? '✅ Set' : '❌ Missing',
 });
 
 // Health check
@@ -89,6 +97,15 @@ app.use('/api/options/metadata', optionsMetadataRouter);
 app.use('/api/gex', gexRouter);
 app.use('/api/live-scanner', liveScannerRouter);
 
+// ThriveCart webhook - IMPORTANT: Must use raw body for signature verification
+// The webhook endpoint handles its own body parsing
+app.use('/api/thrivecart', thrivecartWebhookRouter);
+
+// Also mount at /webhook for compatibility with some webhook providers
+app.use('/webhook', thrivecartWebhookRouter);
+
+// Authentication routes
+app.use('/api/auth', authRouter);
 // Stock ticker info endpoint - fetches company details and price data using Massive.com API
 app.get('/api/stock/:ticker/info', async (req, res) => {
   try {
