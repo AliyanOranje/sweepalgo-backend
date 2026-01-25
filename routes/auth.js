@@ -165,7 +165,7 @@ router.post('/resend-password-reset', async (req, res) => {
     // Use Supabase's built-in resetPasswordForEmail
     // This sends the email directly through Supabase (works for ANY email address)
     const { error: resetError } = await getSupabaseAdmin().auth.resetPasswordForEmail(normalizedEmail, {
-      redirectTo: `${frontendUrl}/set-password`,
+      redirectTo: `${frontendUrl}/set-password?welcome=true`,
     });
     
     if (resetError) {
