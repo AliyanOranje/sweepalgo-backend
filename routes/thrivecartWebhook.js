@@ -187,58 +187,77 @@ async function createNewUser(customerData, orderData) {
   console.log(`✅ User record created in database`);
   
   // Step 3: Send password setup email to the new user
-  // IMPORTANT: Use Supabase's built-in email first (works for any email address)
-  // Only fall back to custom email if Supabase fails
+  // Wait a moment for Supabase to fully provision the user before sending email
+  console.log(`📧 Waiting 1 second for user to be fully provisioned...`);
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const redirectTo = `${frontendUrl}/set-password?welcome=true`;
   let emailSent = false;
   
   console.log(`📧 Sending password setup email to ${email}...`);
+  console.log(`📧 Redirect URL: ${redirectTo}`);
   
+  // Use the SAME method that works from the "Resend Password Reset" button
+  // This is Supabase's built-in resetPasswordForEmail - it's reliable and works
   try {
-    // PRIMARY METHOD: Use Supabase's built-in resetPasswordForEmail
-    // This works for ANY email address and doesn't require domain verification
+    console.log('📧 Calling Supabase resetPasswordForEmail...');
     const { error: supabaseEmailError } = await getSupabaseAdmin().auth.resetPasswordForEmail(email, {
-      redirectTo: `${frontendUrl}/set-password?welcome=true`,
+      redirectTo,
     });
     
     if (supabaseEmailError) {
       console.error('⚠️ Supabase email failed:', supabaseEmailError.message);
-      
-      // FALLBACK: Try custom email service (Resend)
-      // This only works if you have a verified domain in Resend
-      console.log('📧 Trying custom email service as fallback...');
-      
-      try {
-        const { data: linkData, error: linkError } = await getSupabaseAdmin().auth.admin.generateLink({
-          type: 'recovery',
-          email: email,
-          options: {
-            redirectTo: `${frontendUrl}/set-password?welcome=true`,
-          },
-        });
-        
-        if (!linkError && linkData?.properties?.action_link) {
-          await sendWelcomeEmail({
-            email,
-            firstName,
-            subscriptionTier,
-            redirectUrl: linkData.properties.action_link,
-          });
-          emailSent = true;
-          console.log(`✅ Custom welcome email sent to ${email}`);
-        } else {
-          console.error('⚠️ Failed to generate link:', linkError?.message);
-        }
-      } catch (customEmailError) {
-        console.error('⚠️ Custom email also failed:', customEmailError.message);
-      }
+      console.error('⚠️ Full error:', JSON.stringify(supabaseEmailError));
     } else {
       emailSent = true;
       console.log(`✅ Password reset email sent via Supabase to ${email}`);
     }
-    
   } catch (err) {
-    console.error('⚠️ Error in email sending process:', err.message);
+    console.error('⚠️ Exception calling resetPasswordForEmail:', err.message);
+  }
+  
+  // If Supabase failed, try generating link and using custom email as fallback
+  if (!emailSent) {
+    console.log('📧 Supabase failed, trying custom email as fallback...');
+    try {
+      const { data: linkData, error: linkError } = await getSupabaseAdmin().auth.admin.generateLink({
+        type: 'recovery',
+        email: email,
+        options: { redirectTo },
+      });
+      
+      if (!linkError && linkData?.properties?.action_link) {
+        const recoveryLink = linkData.properties.action_link;
+        console.log(`✅ Recovery link generated: ${recoveryLink.substring(0, 80)}...`);
+        
+        try {
+          await sendWelcomeEmail({
+            email,
+            firstName,
+            subscriptionTier,
+            redirectUrl: recoveryLink,
+          });
+          emailSent = true;
+          console.log(`✅ Welcome email sent via custom provider to ${email}`);
+        } catch (customEmailError) {
+          console.warn('⚠️ Custom email also failed:', customEmailError.message);
+          // Log the link for manual sharing
+          console.log('');
+          console.log('╔════════════════════════════════════════════════════════════════╗');
+          console.log('║ ⚠️  EMAIL DELIVERY FAILED - MANUAL LINK BELOW                   ║');
+          console.log('╠════════════════════════════════════════════════════════════════╣');
+          console.log(`║ User: ${email}`);
+          console.log(`║ Link: ${recoveryLink}`);
+          console.log('╚════════════════════════════════════════════════════════════════╝');
+          console.log('');
+        }
+      } else {
+        console.error('⚠️ Failed to generate recovery link:', linkError?.message);
+      }
+    } catch (err) {
+      console.error('⚠️ Exception in fallback email:', err.message);
+    }
   }
   
   console.log(`📧 Email sent status: ${emailSent ? 'SUCCESS' : 'FAILED'}`);
@@ -293,17 +312,47 @@ async function updateExistingUser(existingUser, orderData) {
   
   // Send password reset link (in case they forgot or need to set one)
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const redirectTo = `${frontendUrl}/set-password?welcome=true`;
+  let emailSent = false;
+  let recoveryLink = null;
+  
   try {
+    // Generate the link first
+    const { data: linkData, error: linkError } = await getSupabaseAdmin().auth.admin.generateLink({
+      type: 'recovery',
+      email: existingUser.email.toLowerCase(),
+      options: { redirectTo },
+    });
+    
+    if (!linkError && linkData?.properties?.action_link) {
+      recoveryLink = linkData.properties.action_link;
+      console.log(`✅ Recovery link generated for existing user`);
+    }
+    
+    // Try Supabase's email
     const { error: emailErr } = await getSupabaseAdmin().auth.resetPasswordForEmail(existingUser.email.toLowerCase(), {
-      redirectTo: `${frontendUrl}/set-password?welcome=true`,
+      redirectTo,
     });
     if (emailErr) {
       console.warn('⚠️ Could not send reset link to existing user:', emailErr.message);
     } else {
+      emailSent = true;
       console.log(`✅ Password reset link sent to ${existingUser.email}`);
     }
   } catch (e) {
     console.warn('⚠️ Error sending reset link:', e.message);
+  }
+  
+  // Log recovery link if email failed
+  if (!emailSent && recoveryLink) {
+    console.log('');
+    console.log('╔════════════════════════════════════════════════════════════════╗');
+    console.log('║ ⚠️  EMAIL DELIVERY FAILED - MANUAL LINK BELOW                   ║');
+    console.log('╠════════════════════════════════════════════════════════════════╣');
+    console.log(`║ User: ${existingUser.email}`);
+    console.log(`║ Link: ${recoveryLink}`);
+    console.log('╚════════════════════════════════════════════════════════════════╝');
+    console.log('');
   }
   
   return {

@@ -162,21 +162,38 @@ router.post('/resend-password-reset', async (req, res) => {
     
     console.log(`✅ User found: ${user.first_name} (${normalizedEmail})`);
     
-    // Use Supabase's built-in resetPasswordForEmail
-    // This sends the email directly through Supabase (works for ANY email address)
+    const redirectTo = `${frontendUrl}/set-password?welcome=true`;
+    
+    console.log(`📧 Redirect URL: ${redirectTo}`);
+    
+    // Use Supabase's built-in resetPasswordForEmail - this is the most reliable method
+    // It handles email sending internally and respects rate limits
     const { error: resetError } = await getSupabaseAdmin().auth.resetPasswordForEmail(normalizedEmail, {
-      redirectTo: `${frontendUrl}/set-password?welcome=true`,
+      redirectTo,
     });
     
     if (resetError) {
-      console.error('❌ Error sending password reset email:', resetError);
+      console.error('⚠️ Supabase email failed:', resetError.message);
+      
+      // Check if it's a rate limit error
+      if (resetError.message.includes('security purposes') || resetError.message.includes('after')) {
+        // Extract seconds from error message if possible
+        const match = resetError.message.match(/after (\d+) seconds/);
+        const seconds = match ? match[1] : '60';
+        return res.status(429).json({
+          success: false,
+          error: `Please wait ${seconds} seconds before requesting another password reset email.`,
+          retryAfter: parseInt(seconds),
+        });
+      }
+      
       return res.status(500).json({
         success: false,
         error: 'Failed to send password reset email. Please try again.',
       });
     }
     
-    console.log(`✅ Password reset email sent to ${normalizedEmail}`);
+    console.log(`✅ Password reset email sent via Supabase to ${normalizedEmail}`);
     
     return res.json({
       success: true,
