@@ -1,6 +1,6 @@
 import express from 'express';
 import axios from 'axios';
-import { recentTradesMap } from '../utils/optionsCalculations.js';
+import { recentTradesMap, calculateGEXSetupScore, generateProTip } from '../utils/optionsCalculations.js';
 
 const router = express.Router();
 
@@ -169,11 +169,11 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
       spotPrice
     );
     
-    // ✅ CORRECT: Store both absolute value (for sorting) and netGEX (for filtering)
+    // Store netGEX with sign preserved for proper gamma wall detection
     gexByStrike.push({
       strike: option.strike,
-      gex: Math.abs(netGEX),    // For sorting by magnitude
-      netGEX: netGEX            // Keep sign for filtering
+      gex: Math.abs(netGEX),    // For sorting by magnitude (support/resistance)
+      netGEX: netGEX            // Keep sign for gamma wall filtering
     });
   });
   
@@ -186,16 +186,22 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
     };
   }
   
-  // ✅ CORRECT: Find gamma wall (highest ABSOLUTE GEX, regardless of sign)
-  const gammaWallData = gexByStrike.reduce((max, current) => 
-    current.gex > max.gex ? current : max
-  );
+  // ✅ FIX BUG #1: Find gamma wall as highest NET POSITIVE GEX strike
+  // Gamma wall = strike where positive gamma concentration is highest
+  // Positive gamma = market makers dampen moves = support/resistance
+  // Negative gamma should NOT be treated as a gamma wall
+  const positiveGEXStrikes = gexByStrike.filter(s => s.netGEX > 0);
+  const gammaWallData = positiveGEXStrikes.length > 0
+    ? positiveGEXStrikes.reduce((max, current) => 
+        current.netGEX > max.netGEX ? current : max
+      )
+    : null;
   
-  const gammaWall = {
+  const gammaWall = gammaWallData ? {
     strike: gammaWallData.strike,
-    gex: gammaWallData.gex,
-    isPositive: gammaWallData.netGEX > 0
-  };
+    gex: gammaWallData.netGEX,  // Use actual positive netGEX value (not Math.abs)
+    isPositive: true             // Always positive now (filtered above)
+  } : null;
   
   // ✅ CORRECT: Support = HIGH POSITIVE GEX BELOW spot price
   // (Market makers will buy dips, creating support)
@@ -217,7 +223,7 @@ function findKeyGEXLevels(optionsChain, spotPrice) {
   const maxPain = calculateMaxPain(optionsChain, spotPrice);
   
   return {
-    gammaWall: gammaWall.gex > 0 ? gammaWall : null,
+    gammaWall: gammaWall && gammaWall.gex > 0 ? gammaWall : null,
     support,
     resistance,
     maxPain
@@ -522,10 +528,13 @@ router.get('/:ticker', async (req, res) => {
     
     const aggregatedStrikesList = Object.values(aggregatedGEXByStrike);
     
-    // Find gamma wall (strike with highest ABSOLUTE netGEX across all expirations)
-    const gammaWallData = aggregatedStrikesList.length > 0 
-      ? aggregatedStrikesList.reduce((max, curr) => 
-          Math.abs(curr.netGEX) > Math.abs(max.netGEX) ? curr : max
+    // ✅ FIX BUG #1: Find gamma wall as highest NET POSITIVE GEX strike across all expirations
+    // Only positive gamma creates real support/resistance (market makers dampen moves)
+    // Negative gamma amplifies moves - should NOT be treated as a gamma wall
+    const positiveGEXStrikes = aggregatedStrikesList.filter(s => s.netGEX > 0);
+    const gammaWallData = positiveGEXStrikes.length > 0 
+      ? positiveGEXStrikes.reduce((max, curr) => 
+          curr.netGEX > max.netGEX ? curr : max
         )
       : null;
     
@@ -567,8 +576,8 @@ router.get('/:ticker', async (req, res) => {
     const keyLevels = {
       gammaWall: gammaWallData ? { 
         strike: gammaWallData.strike, 
-        gex: Math.abs(gammaWallData.netGEX),
-        isPositive: gammaWallData.netGEX > 0
+        gex: gammaWallData.netGEX,   // ✅ FIX BUG #1: Already positive (filtered above), no Math.abs needed
+        isPositive: true              // Always positive now
       } : null,
       support: supportLevels,
       resistance: resistanceLevels,
@@ -852,6 +861,21 @@ router.get('/:ticker', async (req, res) => {
       console.error(`❌ CRITICAL ERROR: Expiration count (${formattedExpirations.length}) doesn't match data columns (${heatmapData[0]?.values?.length})!`);
     }
     
+    // ✅ FIX BUG #3: Calculate GEX-aware setup score
+    const setupAnalysis = calculateGEXSetupScore(
+      ticker.toUpperCase(),
+      spotPrice,
+      keyLevels.gammaWall?.strike || null,
+      keyLevels.gammaWall?.gex || 0,
+      totalNetGEX,
+      gammaFlip
+    );
+    
+    // ✅ FIX BUG #2: Generate dynamic pro tip
+    const proTip = keyLevels.gammaWall 
+      ? generateProTip(keyLevels.gammaWall.strike, keyLevels.gammaWall.gex, spotPrice)
+      : null;
+    
     const responseData = {
       success: true,
       ticker: ticker.toUpperCase(),
@@ -868,6 +892,8 @@ router.get('/:ticker', async (req, res) => {
         maxPain: keyLevels.maxPain,
         support: keyLevels.support,
         resistance: keyLevels.resistance,
+        setupScore: setupAnalysis,
+        proTip: proTip,
       },
       heatmap: {
         strikes: finalStrikes,
