@@ -127,13 +127,24 @@ function generateTradePlan(contract, gexPosition, setupScore, spotPrice) {
   target1 = entry * (1 + target1Percent);
   target2 = entry * (1 + target2Percent);
   
-  // Generate "Why" reasoning
+  // ✅ FIX BUG #2: Generate "Why" reasoning with clear, actionable language
   const whyReasons = [];
   
   if (gexPosition.position === 'below' && isCall) {
-    whyReasons.push('Price below gamma wall creates bullish momentum as market makers hedge');
+    if (gexPosition.gammaWall) {
+      const distancePercent = ((gexPosition.gammaWall - spotPrice) / spotPrice * 100).toFixed(1);
+      whyReasons.push(`Price ${distancePercent}% below KEY RESISTANCE at $${gexPosition.gammaWall.toFixed(0)}. Clear runway to target.`);
+    } else {
+      whyReasons.push('Price below key resistance level with clear upside runway');
+    }
   } else if (gexPosition.position === 'above' && !isCall) {
-    whyReasons.push('Price above gamma wall creates bearish momentum as market makers hedge');
+    if (gexPosition.gammaWall) {
+      whyReasons.push(`Price above KEY SUPPORT at $${gexPosition.gammaWall.toFixed(0)}. If support breaks, expect FAST downside.`);
+    } else {
+      whyReasons.push('Price above key support level. Break below could trigger fast downside.');
+    }
+  } else if (gexPosition.position === 'at') {
+    whyReasons.push('Price at gamma wall - critical decision point. Watch for volume-confirmed break.');
   }
   
   if (contract.volume > 5000) {
