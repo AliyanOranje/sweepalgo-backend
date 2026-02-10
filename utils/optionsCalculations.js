@@ -108,7 +108,7 @@ async function getSpotPrice(ticker) {
     }
     lastSpotPriceRequest = Date.now();
     
-    // Fetch from API
+    // Fetch from Massive.com API (Polygon.io rebranded)
     const response = await axios.get(
       `https://api.massive.com/v2/aggs/ticker/${ticker}/prev`,
       {
