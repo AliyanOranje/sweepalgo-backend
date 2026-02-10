@@ -679,12 +679,16 @@ async function handleSubscriptionCancelled(payload) {
   }
   
   const oldStatus = user.subscription_status;
+  const oldTier = user.subscription_tier;
   
-  // Update subscription status - user can still log in
+  // Update subscription status AND downgrade tier to 'free'
+  // User loses platform access immediately (hasActiveSubscription checks status === 'active')
+  // Tier is also set to 'free' for data consistency with refund behavior
   const { error: updateError } = await getSupabaseAdmin()
     .from('users')
     .update({
       subscription_status: 'cancelled',
+      subscription_tier: 'free',
       updated_at: new Date().toISOString(),
     })
     .eq('id', user.id);
@@ -694,14 +698,14 @@ async function handleSubscriptionCancelled(payload) {
     throw new Error(`Failed to process cancellation: ${updateError.message}`);
   }
   
-  console.log(`✅ Subscription cancelled for ${user.email}`);
+  console.log(`✅ Subscription cancelled for ${user.email} - downgraded to free tier, platform access revoked`);
   
   // Log the cancellation event
   await logSubscriptionEvent({
     userId: user.id,
     eventType: 'subscription.cancelled',
-    oldTier: user.subscription_tier,
-    newTier: user.subscription_tier, // Tier doesn't change on cancellation
+    oldTier,
+    newTier: 'free',
     oldStatus,
     newStatus: 'cancelled',
     orderId: user.thrivecart_order_id,
@@ -758,12 +762,20 @@ async function handleSubscriptionRenewed(payload) {
   }
   
   const oldStatus = user.subscription_status;
+  const oldTier = user.subscription_tier;
   
-  // Update subscription status to active
+  // Determine renewed tier from product info, or restore to 'pro' (default subscription tier)
+  const productId = (
+    payload.base_product || payload.product_id || payload.product?.id || 'sweepalgo'
+  ).toString().toLowerCase();
+  const renewedTier = getSubscriptionTier(productId);
+  
+  // Update subscription status to active AND restore tier
   const { error: updateError } = await getSupabaseAdmin()
     .from('users')
     .update({
       subscription_status: 'active',
+      subscription_tier: renewedTier,
       updated_at: new Date().toISOString(),
     })
     .eq('id', user.id);
@@ -773,14 +785,14 @@ async function handleSubscriptionRenewed(payload) {
     throw new Error(`Failed to process renewal: ${updateError.message}`);
   }
   
-  console.log(`✅ Subscription renewed for ${user.email}`);
+  console.log(`✅ Subscription renewed for ${user.email} - restored to ${renewedTier} tier, platform access granted`);
   
   // Log the renewal event
   await logSubscriptionEvent({
     userId: user.id,
     eventType: 'subscription.renewed',
-    oldTier: user.subscription_tier,
-    newTier: user.subscription_tier,
+    oldTier,
+    newTier: renewedTier,
     oldStatus,
     newStatus: 'active',
     orderId,
@@ -834,11 +846,16 @@ async function handlePaymentFailed(payload) {
     throw new Error('User not found for payment failure');
   }
   
-  // Update status to payment_failed
+  const oldTier = user.subscription_tier;
+  const oldStatus = user.subscription_status;
+  
+  // Update status to payment_failed AND downgrade tier to 'free'
+  // User loses platform access (hasActiveSubscription checks status === 'active')
   const { error: updateError } = await getSupabaseAdmin()
     .from('users')
     .update({
       subscription_status: 'payment_failed',
+      subscription_tier: 'free',
       updated_at: new Date().toISOString(),
     })
     .eq('id', user.id);
@@ -847,15 +864,15 @@ async function handlePaymentFailed(payload) {
     console.error('❌ Error updating payment failure:', updateError);
   }
   
-  console.log(`⚠️ Payment failed for ${user.email}`);
+  console.log(`⚠️ Payment failed for ${user.email} - downgraded to free tier, platform access revoked`);
   
   // Log the payment failure event
   await logSubscriptionEvent({
     userId: user.id,
     eventType: 'subscription.payment_failed',
-    oldTier: user.subscription_tier,
-    newTier: user.subscription_tier,
-    oldStatus: user.subscription_status,
+    oldTier,
+    newTier: 'free',
+    oldStatus,
     newStatus: 'payment_failed',
     orderId,
     amount: null,
