@@ -974,6 +974,22 @@ router.get('/:ticker/heatmap', async (req, res) => {
  * 1. First getting all available expiration dates from contracts endpoint
  * 2. Then fetching snapshot data for each expiration date
  */
+// Map index tickers to Polygon/Massive.com's required format (I: prefix for indices)
+const INDEX_TICKER_MAP = {
+  'SPX': 'I:SPX',
+  'SPXW': 'I:SPXW',
+  'NDX': 'I:NDX',
+  'XSP': 'I:XSP',
+  'VIX': 'I:VIX',
+  'RUT': 'I:RUT',
+  'DJX': 'I:DJX',
+};
+
+function getApiTicker(ticker) {
+  const upper = ticker.toUpperCase();
+  return INDEX_TICKER_MAP[upper] || upper;
+}
+
 async function fetchOptionsChain(ticker) {
   try {
     const apiKey = process.env.POLYGON_API_KEY;
@@ -982,7 +998,9 @@ async function fetchOptionsChain(ticker) {
       throw new Error('POLYGON_API_KEY not set');
     }
     
-    console.log(`📡 Fetching options chain for ${ticker} from Massive.com...`);
+    // Map index tickers to API format (e.g., SPX -> I:SPX)
+    const apiTicker = getApiTicker(ticker);
+    console.log(`📡 Fetching options chain for ${ticker} (API ticker: ${apiTicker}) from Massive.com...`);
     
     // STEP 1: OPTIMIZED - Fetch expiration dates from contracts endpoint (limited pages for speed)
     // We only need expiration dates for UI, not all contracts
@@ -997,7 +1015,7 @@ async function fetchOptionsChain(ticker) {
       try {
         const contractsResponse = await axios.get(contractsCurrentUrl, {
           params: contractsPageCount === 0 ? {
-            underlying_ticker: ticker.toUpperCase(),
+            underlying_ticker: apiTicker,
             apiKey: apiKey,
             limit: 100, // API maximum per page (not 1000!)
           } : undefined,
@@ -1046,9 +1064,9 @@ async function fetchOptionsChain(ticker) {
     // STEP 2: Fetch ALL snapshot data (single call, paginated)
     // CRITICAL: Snapshot endpoint does NOT paginate by expiry - it returns mixed expirations
     // We fetch all pages once, then group locally by expiration_date + strike_price
-    console.log(`📡 Step 2: Fetching ALL snapshot data (paginated, mixed expirations - will group locally)...`);
+    console.log(`📡 Step 2: Fetching ALL snapshot data for ${apiTicker} (paginated, mixed expirations - will group locally)...`);
     let allContracts = [];
-    const url = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
+    const url = `https://api.massive.com/v3/snapshot/options/${apiTicker}`;
     let currentUrl = url;
     let pageCount = 0;
     const maxPages = 100; // Reduced from 200 to speed up - most tickers don't need 200 pages
