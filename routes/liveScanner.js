@@ -852,6 +852,82 @@ router.get('/debug', async (req, res) => {
 });
 
 /**
+ * GET /api/live-scanner/option-quote
+ * Fetch current option price for a contract (for % change from entry in Alert Setup modal).
+ * Query: ticker, strike, type (CALL|PUT), expiry (YYYY-MM-DD or M/D/YYYY).
+ */
+router.get('/option-quote', async (req, res) => {
+  try {
+    const { ticker, strike, type, expiry } = req.query;
+    if (!ticker || strike === undefined || strike === '' || !type || !expiry) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required query params: ticker, strike, type, expiry',
+      });
+    }
+    const strikeNum = parseFloat(strike);
+    if (isNaN(strikeNum)) {
+      return res.status(400).json({ success: false, error: 'Invalid strike' });
+    }
+    const typeUpper = String(type).toUpperCase();
+    if (typeUpper !== 'CALL' && typeUpper !== 'PUT') {
+      return res.status(400).json({ success: false, error: 'type must be CALL or PUT' });
+    }
+    // Normalize expiry to YYYY-MM-DD for comparison
+    let expiryNorm = null;
+    const expiryStr = String(expiry).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(expiryStr)) {
+      expiryNorm = expiryStr;
+    } else {
+      const d = new Date(expiryStr);
+      if (!isNaN(d.getTime())) {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        expiryNorm = `${y}-${m}-${day}`;
+      }
+    }
+    if (!expiryNorm) {
+      return res.status(400).json({ success: false, error: 'Invalid expiry date' });
+    }
+
+    const snapshotUrl = `https://api.massive.com/v3/snapshot/options/${ticker.toUpperCase()}`;
+    const params = { apiKey, order: 'asc', limit: 250, sort: 'ticker' };
+    const response = await axios.get(snapshotUrl, { params, timeout: 10000 });
+    const results = response.data?.results || [];
+    if (results.length === 0) {
+      return res.json({ success: false, price: null, error: 'No contracts returned' });
+    }
+
+    for (const contract of results) {
+      const parsed = parseOptionSymbol(contract.ticker || contract.symbol || contract.details?.ticker);
+      if (!parsed) continue;
+      const contractStrike = parsed.strike ?? contract.details?.strike_price ?? contract.strike_price;
+      if (contractStrike == null || Math.abs(parseFloat(contractStrike) - strikeNum) > 0.01) continue;
+      const contractType = (parsed.type || (contract.details?.contract_type === 'call' ? 'CALL' : 'PUT') || 'CALL').toUpperCase();
+      if (contractType !== typeUpper) continue;
+      const expStr = contract.details?.expiration_date || contract.expiration_date;
+      if (!expStr) continue;
+      const expNorm = expStr.split('T')[0];
+      if (expNorm !== expiryNorm) continue;
+
+      const price = contract.last_trade?.price ||
+        contract.last_quote?.midpoint ||
+        contract.mark ||
+        contract.last ||
+        ((contract.last_quote?.bid ?? contract.bid ?? 0) + (contract.last_quote?.ask ?? contract.ask ?? 0)) / 2;
+      if (price != null && price > 0) {
+        return res.json({ success: true, price: Number(price) });
+      }
+    }
+    return res.json({ success: false, price: null, error: 'Matching contract not found or no price' });
+  } catch (err) {
+    console.error('Option quote error:', err.message);
+    return res.status(500).json({ success: false, price: null, error: err.message });
+  }
+});
+
+/**
  * GET /api/live-scanner
  * Scan watchlist and return alerts
  */
