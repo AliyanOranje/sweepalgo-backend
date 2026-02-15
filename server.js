@@ -120,32 +120,21 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
     // Support both env var names (live may use MASSIVE_API_KEY)
     const apiKey = process.env.POLYGON_API_KEY || process.env.MASSIVE_API_KEY;
     
-    console.log(`📡 Fetching stock info for ${ticker} (Polygon/Massive only)...`);
+    console.log(`📡 Fetching stock info for ${ticker}...`);
 
-    if (!apiKey) {
-      return res.status(503).json({
-        success: false,
-        ticker: ticker.toUpperCase(),
-        error: 'Polygon/Massive API key required',
-        message: 'Set POLYGON_API_KEY or MASSIVE_API_KEY in environment.',
-        name: ticker.toUpperCase(),
-        exchange: 'UNKNOWN',
-        industry: 'UNKNOWN',
-        marketCap: 'N/A',
-        price: 0,
-        prevClose: 0,
-        todaysChange: 0,
-        todaysChangePerc: 0,
-      });
-    }
-
-    // Client requirement: use only Polygon.io / Massive.com (same API, rebranded)
     const base = 'https://api.polygon.io';
-    const [tickerDetailsRes, prevCloseRes, snapshotRes] = await Promise.all([
-      axios.get(`${base}/v3/reference/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Ticker details: ${err.message}`); return null; }),
-      axios.get(`${base}/v2/aggs/ticker/${ticker.toUpperCase()}/prev`, { params: { adjusted: true, apiKey } }).catch(err => { console.warn(`⚠️ Prev close: ${err.message}`); return null; }),
-      axios.get(`${base}/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Snapshot: ${err.message}`); return null; }),
-    ]);
+    let tickerDetailsRes = null;
+    let prevCloseRes = null;
+    let snapshotRes = null;
+    if (apiKey) {
+      [tickerDetailsRes, prevCloseRes, snapshotRes] = await Promise.all([
+        axios.get(`${base}/v3/reference/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Ticker details: ${err.message}`); return null; }),
+        axios.get(`${base}/v2/aggs/ticker/${ticker.toUpperCase()}/prev`, { params: { adjusted: true, apiKey } }).catch(err => { console.warn(`⚠️ Prev close: ${err.message}`); return null; }),
+        axios.get(`${base}/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Snapshot: ${err.message}`); return null; }),
+      ]);
+    } else {
+      console.warn(`⚠️ POLYGON_API_KEY / MASSIVE_API_KEY not set — using Yahoo fallback for price/change`);
+    }
 
     const details = tickerDetailsRes?.data?.results || {};
     const prevCloseData = prevCloseRes?.data?.results?.[0] || {};
@@ -252,7 +241,7 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
         const yahooRes = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker.toUpperCase()}`, {
           params: { range: '5d', interval: '1d', includePrePost: false },
           headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
-          timeout: 8000,
+          timeout: 15000,
         });
         const meta = yahooRes?.data?.chart?.result?.[0]?.meta || {};
         const quotes = yahooRes?.data?.chart?.result?.[0]?.indicators?.quote?.[0] || {};
