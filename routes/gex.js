@@ -7,6 +7,11 @@ const router = express.Router();
 // Risk-free rate (10-year Treasury yield approximation)
 const RISK_FREE_RATE = 0.045; // 4.5%
 
+// Short-lived cache for GEX responses (avoids re-fetching 280 pages on every SPX refresh)
+const GEX_CACHE_TTL_MS = 90 * 1000;   // 90s for index tickers
+const GEX_CACHE_TTL_EQUITY_MS = 60 * 1000; // 60s for equities
+const gexResponseCache = new Map(); // key: ticker (upper), value: { data, expires }
+
 // ============================================
 // BLACK-SCHOLES CALCULATIONS (JavaScript)
 // ============================================
@@ -283,7 +288,16 @@ router.get('/:ticker', async (req, res) => {
   try {
     const { ticker } = req.params;
     const { expiration } = req.query; // Optional: filter by expiration
-    
+    const tickerUpper = (ticker || '').toUpperCase();
+
+    // Serve from cache if valid (reduces load time for SPX on refresh/auto-refresh)
+    const cached = gexResponseCache.get(tickerUpper);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`📊 [GEX Route] Serving ${ticker} from cache`);
+      return res.json(cached.data);
+    }
+    if (cached) gexResponseCache.delete(tickerUpper);
+
     console.log(`📊 [GEX Route] Fetching GEX data for ${ticker}...`);
     console.log(`📊 [GEX Route] Request params:`, req.params);
     console.log(`📊 [GEX Route] Request query:`, req.query);
@@ -528,29 +542,34 @@ router.get('/:ticker', async (req, res) => {
     
     const aggregatedStrikesList = Object.values(aggregatedGEXByStrike);
     
-    // ✅ FIX BUG #1: Find gamma wall as highest NET POSITIVE GEX strike across all expirations
-    // Only positive gamma creates real support/resistance (market makers dampen moves)
-    // Negative gamma amplifies moves - should NOT be treated as a gamma wall
-    const positiveGEXStrikes = aggregatedStrikesList.filter(s => s.netGEX > 0);
+    // Limit key-level analysis to strikes within ±20% of spot price.
+    // Far OTM LEAPS (e.g. $105 calls on TSLA @ $417) have inflated GEX due to
+    // high OI but are irrelevant for near-term support/resistance.
+    const relevantLowerBound = spotPrice * 0.80;
+    const relevantUpperBound = spotPrice * 1.20;
+    const relevantStrikes = aggregatedStrikesList.filter(
+      s => s.strike >= relevantLowerBound && s.strike <= relevantUpperBound
+    );
+    
+    // Find gamma wall: highest NET POSITIVE GEX strike within relevant range
+    const positiveGEXStrikes = relevantStrikes.filter(s => s.netGEX > 0);
     const gammaWallData = positiveGEXStrikes.length > 0 
       ? positiveGEXStrikes.reduce((max, curr) => 
           curr.netGEX > max.netGEX ? curr : max
         )
       : null;
     
-    // Find support levels: HIGH POSITIVE GEX strikes BELOW spot price
-    // (Market makers buy dips here, creating support)
-    const supportLevels = aggregatedStrikesList
+    // Find support levels: HIGH POSITIVE GEX strikes BELOW spot price (within relevant range)
+    const supportLevels = relevantStrikes
       .filter(s => s.strike < spotPrice && s.netGEX > 0)
-      .sort((a, b) => b.netGEX - a.netGEX) // Sort by netGEX descending
+      .sort((a, b) => b.netGEX - a.netGEX)
       .slice(0, 3)
       .map(s => ({ strike: s.strike, gex: s.netGEX }));
     
-    // Find resistance levels: HIGH POSITIVE GEX strikes ABOVE spot price
-    // (Market makers sell rallies here, creating resistance)  
-    const resistanceLevels = aggregatedStrikesList
+    // Find resistance levels: HIGH POSITIVE GEX strikes ABOVE spot price (within relevant range)
+    const resistanceLevels = relevantStrikes
       .filter(s => s.strike > spotPrice && s.netGEX > 0)
-      .sort((a, b) => b.netGEX - a.netGEX) // Sort by netGEX descending
+      .sort((a, b) => b.netGEX - a.netGEX)
       .slice(0, 3)
       .map(s => ({ strike: s.strike, gex: s.netGEX }));
     
@@ -710,38 +729,9 @@ router.get('/:ticker', async (req, res) => {
     // Get all strikes and sort descending (highest first)
     const strikes = Array.from(allStrikes).sort((a, b) => b - a);
     
-    // Expand strike range if needed to match reference (shows wide range like 550 to 15)
-    // Find min and max strikes
-    const minStrike = strikes.length > 0 ? Math.min(...strikes) : 0;
-    const maxStrike = strikes.length > 0 ? Math.max(...strikes) : 0;
-    const spotPriceNum = parseFloat(spotPrice) || 0;
-    
-    // Generate additional strikes around the current price if range is too narrow
-    // This ensures we have a comprehensive view like the reference
-    const expandedStrikes = new Set(strikes);
-    
-    // Add strikes below current price (down to ~20% below)
-    if (spotPriceNum > 0) {
-      const lowerBound = Math.max(minStrike, spotPriceNum * 0.2);
-      const upperBound = Math.min(maxStrike, spotPriceNum * 2.0);
-      
-      // Generate strikes in $2.50 increments for wider range
-      for (let s = Math.ceil(lowerBound / 2.5) * 2.5; s <= Math.floor(upperBound / 2.5) * 2.5; s += 2.5) {
-        if (s > 0 && s <= upperBound) {
-          expandedStrikes.add(s);
-        }
-      }
-      
-      // Also add $5 increments for very wide range
-      for (let s = Math.ceil(lowerBound / 5) * 5; s <= Math.floor(upperBound / 5) * 5; s += 5) {
-        if (s > 0 && s <= upperBound) {
-          expandedStrikes.add(s);
-        }
-      }
-    }
-    
-    // Convert back to sorted array (descending)
-    const finalStrikes = Array.from(expandedStrikes).sort((a, b) => b - a);
+    // Show ALL strikes from the data (matches BullFlow behavior — full chain displayed,
+    // auto-scrolled to spot price on the frontend). No filtering here.
+    const finalStrikes = strikes; // Already sorted descending
     
     console.log(`📊 Preparing heatmap: ${finalStrikes.length} strikes (expanded from ${strikes.length}), ${expirations.length} expirations`);
     console.log(`📅 Expiration dates (raw):`, expirations);
@@ -913,14 +903,25 @@ router.get('/:ticker', async (req, res) => {
         console.warn('⚠️ Error broadcasting GEX update:', error.message);
       }
     }
-    
+
+    // Cache response to avoid re-fetching full chain on refresh (SPX is 280 pages)
+    const cacheTtl = isIndexTicker(ticker) ? GEX_CACHE_TTL_MS : GEX_CACHE_TTL_EQUITY_MS;
+    gexResponseCache.set(tickerUpper, { data: responseData, expires: Date.now() + cacheTtl });
+
     res.json(responseData);
   } catch (error) {
     console.error(`❌ Error fetching GEX for ${req.params.ticker}:`, error);
-    res.status(500).json({
+    console.error(`❌ Error stack:`, error.stack);
+    
+    // Ensure we always return a proper error response
+    const errorMessage = error?.message || 'Failed to fetch GEX data';
+    const errorStatus = error?.response?.status || 500;
+    
+    res.status(errorStatus).json({
       success: false,
       error: 'Failed to fetch GEX data',
-      message: error.message,
+      message: errorMessage,
+      ticker: tickerUpper,
     });
   }
 });
@@ -985,9 +986,16 @@ const INDEX_TICKER_MAP = {
   'DJX': 'I:DJX',
 };
 
+/** Index tickers have huge options chains; we need more pages to get accurate Total Net GEX (e.g. match BullFlow). */
+const INDEX_TICKERS = new Set(Object.keys(INDEX_TICKER_MAP));
+
 function getApiTicker(ticker) {
   const upper = ticker.toUpperCase();
   return INDEX_TICKER_MAP[upper] || upper;
+}
+
+function isIndexTicker(ticker) {
+  return INDEX_TICKERS.has((ticker || '').toUpperCase());
 }
 
 async function fetchOptionsChain(ticker) {
@@ -1069,89 +1077,88 @@ async function fetchOptionsChain(ticker) {
     const url = `https://api.massive.com/v3/snapshot/options/${apiTicker}`;
     let currentUrl = url;
     let pageCount = 0;
-    const maxPages = 100; // Reduced from 200 to speed up - most tickers don't need 200 pages
+    let rateLimitRetries = 0;
+    const MAX_RATE_LIMIT_RETRIES = 3; // Max retries per rate-limit hit (prevents infinite loop!)
+    // Keep page counts reasonable to avoid rate limiting
+    const maxPages = isIndexTicker(ticker) ? 200 : 80;
+    const pageDelayMs = isIndexTicker(ticker) ? 20 : 30;
+    if (isIndexTicker(ticker)) {
+      console.log(`📊 [GEX] Index ticker ${ticker}: fetching up to ${maxPages} pages for accurate Net GEX`);
+    }
       
     while (pageCount < maxPages) {
       try {
-        // Use same parameters as optionsFlow.js for consistency
-        // CRITICAL: limit must be 100 (API max per page), not 1000
-        // CRITICAL: For page 0, pass params. For subsequent pages (next_url), don't pass params - URL already has everything
         const response = await axios.get(currentUrl, {
           params: pageCount === 0 ? {
             apiKey: apiKey,
             order: 'asc',
-            limit: 100, // API maximum per page (not 1000!)
+            limit: 100,
             sort: 'ticker',
-          } : undefined, // Don't pass params for next_url pages - URL already contains cursor and params
-          timeout: 60000,
+          } : undefined,
+          timeout: 30000, // 30s timeout per page (was 60s)
         });
         
-        console.log(`📡 API Response status: ${response.status}, results count: ${response.data?.results?.length || 0}`);
+        // Reset rate limit counter on success
+        rateLimitRetries = 0;
         
-        // Check if results is an array (like optionsFlow.js does)
         if (response.data?.results && Array.isArray(response.data.results) && response.data.results.length > 0) {
           allContracts = allContracts.concat(response.data.results);
-          console.log(`📄 Page ${pageCount + 1}: Fetched ${response.data.results.length} contracts (total: ${allContracts.length})`);
+          
+          // Log every 20 pages instead of every page to reduce noise
+          if (pageCount % 20 === 0 || pageCount < 3) {
+            console.log(`📄 Page ${pageCount + 1}: ${response.data.results.length} contracts (total: ${allContracts.length})`);
+          }
           
           if (response.data.next_url && pageCount < maxPages - 1) {
-            // CRITICAL: next_url doesn't include apiKey, we must append it
             let nextUrl = response.data.next_url;
             try {
               const urlObj = new URL(nextUrl);
-              // Remove existing apiKey if present (to avoid duplicates)
               urlObj.searchParams.delete('apiKey');
-              // Add our API key
               urlObj.searchParams.set('apiKey', apiKey);
               nextUrl = urlObj.toString();
             } catch (e) {
-              // If URL parsing fails, append API key as query param
               nextUrl = `${response.data.next_url}${response.data.next_url.includes('?') ? '&' : '?'}apiKey=${apiKey}`;
             }
             currentUrl = nextUrl;
             pageCount++;
-            console.log(`📄 Moving to page ${pageCount + 1}...`);
-            // Reduced delay from 100ms to 50ms for faster fetching
-            await new Promise(resolve => setTimeout(resolve, 50));
+            await new Promise(resolve => setTimeout(resolve, pageDelayMs));
           } else {
-            console.log(`✅ No more pages (next_url: ${response.data.next_url ? 'exists' : 'null'})`);
+            console.log(`✅ No more pages after ${pageCount + 1} (total: ${allContracts.length} contracts)`);
             break;
           }
         } else {
-          console.log(`⚠️ Page ${pageCount + 1}: No results`);
-          console.log(`⚠️ Response structure:`, {
-            hasResults: !!response.data?.results,
-            isArray: Array.isArray(response.data?.results),
-            resultsLength: response.data?.results?.length || 0,
-            status: response.data?.status,
-            requestId: response.data?.request_id,
-          });
           if (pageCount === 0) {
-            // First page has no results - log the full response for debugging
-            console.log(`⚠️ First page full response:`, JSON.stringify(response.data, null, 2).substring(0, 1000));
+            console.warn(`⚠️ First page empty for ${ticker}:`, JSON.stringify(response.data, null, 2).substring(0, 500));
           }
           break;
         }
       } catch (error) {
-        console.error(`❌ Error fetching snapshot page ${pageCount + 1}:`, error.message);
-        if (error.response) {
-          console.error(`❌ Response status: ${error.response.status}`);
-          console.error(`❌ Response data:`, JSON.stringify(error.response.data, null, 2).substring(0, 500));
-        }
+        console.error(`❌ Error on page ${pageCount + 1}: ${error.message}`);
         if (error.response?.status === 429) {
-          // Rate limited - wait longer
-          console.log(`⏳ Rate limited, waiting 2 seconds...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          continue; // Retry this page
+          rateLimitRetries++;
+          if (rateLimitRetries > MAX_RATE_LIMIT_RETRIES) {
+            console.error(`❌ Rate limited ${rateLimitRetries} times — stopping. Got ${allContracts.length} contracts so far.`);
+            break; // USE WHAT WE HAVE instead of hanging forever
+          }
+          console.log(`⏳ Rate limited (attempt ${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES}), waiting 3 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          continue;
         } else if (error.response?.status === 404) {
-          console.error(`❌ 404 - Ticker ${ticker} not found or has no options`);
+          if (pageCount === 0) {
+            throw new Error(`Ticker ${ticker} not found or has no options contracts`);
+          }
           break;
         } else {
+          if (pageCount === 0 && allContracts.length === 0) {
+            throw new Error(`Failed to fetch options data for ${ticker}: ${error.message}`);
+          }
+          console.warn(`⚠️ Error on page ${pageCount + 1}, using ${allContracts.length} contracts fetched so far`);
           break;
         }
       }
     }
     
-    console.log(`✅ Successfully fetched ${allContracts.length} total contracts across ${pageCount} page(s)`);
+    console.log(`✅ Fetched ${allContracts.length} contracts across ${pageCount + 1} pages for ${ticker}`);
     
     if (allContracts.length === 0) {
       console.warn(`⚠️ No contracts fetched from snapshot API for ${ticker}`);
