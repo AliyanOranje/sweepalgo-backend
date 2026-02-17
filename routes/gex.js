@@ -560,11 +560,25 @@ router.get('/:ticker', async (req, res) => {
       : null;
     
     // Find support levels: HIGH POSITIVE GEX strikes BELOW spot price (within relevant range)
-    const supportLevels = relevantStrikes
+    let supportLevels = relevantStrikes
       .filter(s => s.strike < spotPrice && s.netGEX > 0)
       .sort((a, b) => b.netGEX - a.netGEX)
       .slice(0, 3)
       .map(s => ({ strike: s.strike, gex: s.netGEX }));
+    
+    // Fallback 1: if no positive GEX below spot, use gamma wall as support when it's below spot
+    if (supportLevels.length === 0 && gammaWallData && gammaWallData.strike < spotPrice) {
+      supportLevels = [{ strike: gammaWallData.strike, gex: gammaWallData.netGEX }];
+    }
+    // Fallback 2: if still empty (e.g. gamma wall above spot), use strike below spot with highest net GEX (least negative)
+    if (supportLevels.length === 0) {
+      const belowSpot = relevantStrikes
+        .filter(s => s.strike < spotPrice)
+        .sort((a, b) => b.netGEX - a.netGEX)
+        .slice(0, 3)
+        .map(s => ({ strike: s.strike, gex: s.netGEX }));
+      if (belowSpot.length > 0) supportLevels = belowSpot;
+    }
     
     // Find resistance levels: HIGH POSITIVE GEX strikes ABOVE spot price (within relevant range)
     const resistanceLevels = relevantStrikes
