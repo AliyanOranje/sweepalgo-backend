@@ -294,6 +294,8 @@ router.get('/:ticker', async (req, res) => {
     const cached = gexResponseCache.get(tickerUpper);
     if (cached && cached.expires > Date.now()) {
       console.log(`📊 [GEX Route] Serving ${ticker} from cache`);
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.set('Pragma', 'no-cache');
       return res.json(cached.data);
     }
     if (cached) gexResponseCache.delete(tickerUpper);
@@ -922,6 +924,8 @@ router.get('/:ticker', async (req, res) => {
     const cacheTtl = isIndexTicker(ticker) ? GEX_CACHE_TTL_MS : GEX_CACHE_TTL_EQUITY_MS;
     gexResponseCache.set(tickerUpper, { data: responseData, expires: Date.now() + cacheTtl });
 
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     res.json(responseData);
   } catch (error) {
     console.error(`❌ Error fetching GEX for ${req.params.ticker}:`, error);
