@@ -311,6 +311,9 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
       source: useFallback ? 'yahoo_fallback' : 'polygon',
     });
 
+    // Prevent caching so live clients always get fresh price/prevClose (avoids 304 reusing stale zeros)
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     res.json(responseData);
   } catch (error) {
     console.error(`❌ Error fetching stock info for ${req.params.ticker}:`, error.message);
