@@ -12,6 +12,10 @@ const GEX_CACHE_TTL_MS = 90 * 1000;   // 90s for index tickers
 const GEX_CACHE_TTL_EQUITY_MS = 60 * 1000; // 60s for equities
 const gexResponseCache = new Map(); // key: ticker (upper), value: { data, expires }
 
+// Index tickers (e.g. SPX) have 280+ snapshot pages; cap must be high enough to match BullFlow/SpotGamma totals
+const GEX_INDEX_MAX_PAGES = 280;
+const GEX_EQUITY_MAX_PAGES = 80;
+
 // ============================================
 // BLACK-SCHOLES CALCULATIONS (JavaScript)
 // ============================================
@@ -294,6 +298,14 @@ router.get('/:ticker', async (req, res) => {
     const cached = gexResponseCache.get(tickerUpper);
     if (cached && cached.expires > Date.now()) {
       console.log(`📊 [GEX Route] Serving ${ticker} from cache`);
+      // For index tickers: always refresh spot price so it matches BullFlow/live index (avoid stale $6675 vs $6890)
+      if (isIndexTicker(ticker)) {
+        const freshSpot = await fetchIndexSpotPrice(ticker);
+        if (freshSpot != null && freshSpot > 0) {
+          cached.data.spotPrice = freshSpot;
+          console.log(`📊 [GEX Route] Updated cached spot for ${ticker} to $${freshSpot.toFixed(2)}`);
+        }
+      }
       res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.set('Pragma', 'no-cache');
       return res.json(cached.data);
@@ -353,8 +365,12 @@ router.get('/:ticker', async (req, res) => {
     
     console.log(`✅ Successfully fetched ${optionsChain.length} contracts for ${ticker}`);
     
-    // Get spot price
-    const spotPrice = getSpotPrice(optionsChain);
+    // Get spot price: for indices (SPX, etc.) use live index snapshot so it matches BullFlow; else from chain
+    let spotPrice = getSpotPrice(optionsChain);
+    if (isIndexTicker(ticker)) {
+      const indexSpot = await fetchIndexSpotPrice(ticker);
+      if (indexSpot != null && indexSpot > 0) spotPrice = indexSpot;
+    }
     
     if (!spotPrice || spotPrice === 0) {
       return res.status(404).json({
@@ -1016,6 +1032,41 @@ function isIndexTicker(ticker) {
   return INDEX_TICKERS.has((ticker || '').toUpperCase());
 }
 
+/**
+ * Fetch live index spot price from Polygon/Massive indices snapshot.
+ * Used for SPX/SPXW/NDX etc. so GEX uses actual index value (matches BullFlow), not stale chain underlying.
+ */
+async function fetchIndexSpotPrice(ticker) {
+  const apiKey = process.env.POLYGON_API_KEY || process.env.MASSIVE_API_KEY;
+  if (!apiKey) {
+    console.warn('⚠️ [GEX] No POLYGON_API_KEY/MASSIVE_API_KEY for index spot');
+    return null;
+  }
+  const apiTicker = getApiTicker(ticker);
+  const tryTickers = [apiTicker];
+  if (apiTicker.startsWith('I:')) tryTickers.push(apiTicker.slice(2)); // e.g. also try SPX if I:SPX fails
+  for (const t of tryTickers) {
+    try {
+      const res = await axios.get('https://api.polygon.io/v3/snapshot/indices', {
+        params: { 'ticker.any_of': t, apiKey },
+        timeout: 10000,
+      });
+      const results = res.data?.results;
+      if (Array.isArray(results) && results.length > 0 && !results[0].error) {
+        const value = results[0].value != null ? parseFloat(results[0].value) : NaN;
+        if (!isNaN(value) && value > 0) {
+          console.log(`📊 [GEX] Index spot ${ticker}: $${value.toFixed(2)} (from indices snapshot)`);
+          return value;
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠️ Index snapshot for ${ticker} (ticker=${t}):`, err.message);
+    }
+  }
+  console.warn(`⚠️ [GEX] Could not get index spot for ${ticker}; will use chain underlying if available`);
+  return null;
+}
+
 async function fetchOptionsChain(ticker) {
   try {
     const apiKey = process.env.POLYGON_API_KEY;
@@ -1097,11 +1148,11 @@ async function fetchOptionsChain(ticker) {
     let pageCount = 0;
     let rateLimitRetries = 0;
     const MAX_RATE_LIMIT_RETRIES = 3; // Max retries per rate-limit hit (prevents infinite loop!)
-    // Keep page counts reasonable to avoid rate limiting
-    const maxPages = isIndexTicker(ticker) ? 200 : 80;
+    // Fetch full chain for indices (SPX ~280 pages) so Total Net GEX / heatmap match BullFlow
+    const maxPages = isIndexTicker(ticker) ? GEX_INDEX_MAX_PAGES : GEX_EQUITY_MAX_PAGES;
     const pageDelayMs = isIndexTicker(ticker) ? 20 : 30;
     if (isIndexTicker(ticker)) {
-      console.log(`📊 [GEX] Index ticker ${ticker}: fetching up to ${maxPages} pages for accurate Net GEX`);
+      console.log(`📊 [GEX] Index ticker ${ticker}: fetching up to ${maxPages} pages for accurate Net GEX (BullFlow-aligned)`);
     }
       
     while (pageCount < maxPages) {
