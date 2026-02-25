@@ -11,6 +11,9 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { sendPasswordResetEmail } from '../services/emailService.js';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 const router = express.Router();
 
@@ -320,3 +323,4 @@ router.get('/subscription-status', async (req, res) => {
 });
 
 export default router;
+
