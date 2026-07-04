@@ -117,47 +117,49 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
   try {
     const { ticker } = req.params;
     const axios = (await import('axios')).default;
-    const apiKey = process.env.POLYGON_API_KEY;
+    // Support both env var names (live may use MASSIVE_API_KEY)
+    const apiKey = process.env.POLYGON_API_KEY || process.env.MASSIVE_API_KEY;
     
     console.log(`📡 Fetching stock info for ${ticker}...`);
-    
-    // Fetch ticker details, previous close, and snapshot in parallel
-    const [tickerDetailsRes, prevCloseRes, snapshotRes] = await Promise.all([
-      // Get company info (name, exchange, industry, market cap) - Massive.com API
-      axios.get(`https://api.massive.com/v3/reference/tickers/${ticker.toUpperCase()}`, {
-        params: { apiKey }
-      }).catch(err => {
-        console.warn(`⚠️ Could not fetch ticker details: ${err.message}`);
-        return null;
-      }),
-      // Get previous close for price change calculation
-      axios.get(`https://api.massive.com/v2/aggs/ticker/${ticker.toUpperCase()}/prev`, {
-        params: { adjusted: true, apiKey }
-      }).catch(err => {
-        console.warn(`⚠️ Could not fetch prev close: ${err.message}`);
-        return null;
-      }),
-      // Get stock snapshot for real-time data including today's change
-      axios.get(`https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, {
-        params: { apiKey }
-      }).catch(err => {
-        console.warn(`⚠️ Could not fetch snapshot: ${err.message}`);
-        return null;
-      })
-    ]);
 
-    // Extract ticker details
+    const base = 'https://api.polygon.io';
+    let tickerDetailsRes = null;
+    let prevCloseRes = null;
+    let snapshotRes = null;
+    if (apiKey) {
+      [tickerDetailsRes, prevCloseRes, snapshotRes] = await Promise.all([
+        axios.get(`${base}/v3/reference/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Ticker details: ${err.message}`); return null; }),
+        axios.get(`${base}/v2/aggs/ticker/${ticker.toUpperCase()}/prev`, { params: { adjusted: true, apiKey } }).catch(err => { console.warn(`⚠️ Prev close: ${err.message}`); return null; }),
+        axios.get(`${base}/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, { params: { apiKey } }).catch(err => { console.warn(`⚠️ Snapshot: ${err.message}`); return null; }),
+      ]);
+    } else {
+      console.warn(`⚠️ POLYGON_API_KEY / MASSIVE_API_KEY not set — using Yahoo fallback for price/change`);
+    }
+
     const details = tickerDetailsRes?.data?.results || {};
-    const prevClose = prevCloseRes?.data?.results?.[0] || {};
-    const snapshot = snapshotRes?.data?.ticker || {};
+    const prevCloseData = prevCloseRes?.data?.results?.[0] || {};
+    let rawSnapshot = snapshotRes?.data;
+    let snapshot = rawSnapshot?.ticker || rawSnapshot?.results?.[0] || (rawSnapshot && typeof rawSnapshot.day === 'object' ? rawSnapshot : {}) || {};
+    if (!snapshot.day && !snapshot.lastTrade && !snapshot.prevDay) {
+      try {
+        const altRes = await axios.get(`https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/${ticker.toUpperCase()}`, { params: { apiKey } });
+        rawSnapshot = altRes?.data;
+        snapshot = rawSnapshot?.ticker || rawSnapshot?.results?.[0] || (rawSnapshot && typeof rawSnapshot.day === 'object' ? rawSnapshot : {}) || {};
+      } catch (e) {
+        console.warn(`⚠️ Snapshot fallback (massive.com): ${e.message}`);
+      }
+    }
 
-    console.log(`📊 Raw data for ${ticker}:`, {
-      hasDetails: !!tickerDetailsRes?.data?.results,
-      hasPrevClose: !!prevCloseRes?.data?.results?.[0],
-      hasSnapshot: !!snapshotRes?.data?.ticker,
-      detailsName: details.name,
-      prevClosePrice: prevClose.c,
-      snapshotData: snapshot
+    console.log(`📊 Stock info ${ticker}:`, {
+      snapshotStatus: snapshotRes?.status,
+      snapshotHasTicker: !!rawSnapshot?.ticker,
+      snapshotKeys: Object.keys(snapshot),
+      dayC: snapshot.day?.c,
+      prevDayC: snapshot.prevDay?.c,
+      lastTradeP: snapshot.lastTrade?.p,
+      aggsPrevC: prevCloseData?.c ?? prevCloseData?.close,
+      apiChange: snapshot.todaysChange ?? snapshot.todays_change,
+      apiChangePerc: snapshot.todaysChangePerc ?? snapshot.todays_change_perc,
     });
 
     // Format market cap
@@ -194,12 +196,89 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
       return sicDescription.split(' ').slice(0, 2).join(' ').toUpperCase();
     };
 
-    // Get price data from snapshot (most accurate for real-time)
-    // Snapshot has: day (today's OHLCV), prevDay (yesterday's OHLCV), todaysChange, todaysChangePerc
-    const todaysChange = snapshot.todaysChange || 0;
-    const todaysChangePerc = snapshot.todaysChangePerc || 0;
-    const currentPrice = snapshot.day?.c || snapshot.lastTrade?.p || prevClose.c || 0;
-    const previousClose = snapshot.prevDay?.c || prevClose.c || 0;
+    // =====================================================================
+    // PRICE DATA — Polygon/Massive only (snapshot + aggs/prev)
+    // =====================================================================
+
+    // --- Polygon/Massive only: snapshot (real-time) + aggs/prev (previous close) ---
+    const snapDayClose = snapshot.day?.c ?? snapshot.day?.close ?? 0;
+    const snapPrevDayClose = snapshot.prevDay?.c ?? snapshot.prevDay?.close ?? 0;
+    const lastTradePrice = snapshot.lastTrade?.p ?? snapshot.lastTrade?.price ?? snapshot.last?.price ?? 0;
+    // API may return camelCase or snake_case; coerce to number
+    const snapTodaysChange = Number(snapshot.todaysChange ?? snapshot.todays_change);
+    const snapTodaysChangePerc = Number(snapshot.todaysChangePerc ?? snapshot.todays_change_perc);
+
+    const aggsPrevClose = prevCloseData.c ?? prevCloseData.close ?? 0;
+    const aggsPrevOpen = prevCloseData.o ?? prevCloseData.open ?? 0;
+    const aggsPrevHigh = prevCloseData.h ?? prevCloseData.high ?? 0;
+    const aggsPrevLow = prevCloseData.l ?? prevCloseData.low ?? 0;
+    const aggsPrevVolume = prevCloseData.v ?? prevCloseData.volume ?? 0;
+
+    // Current price: snapshot day close or last trade, then aggs prev as fallback
+    const currentPrice = snapDayClose || lastTradePrice || aggsPrevClose || 0;
+    const previousClose = snapPrevDayClose || aggsPrevClose || 0;
+
+    let finalChange = 0;
+    let finalChangePerc = 0;
+    const hasApiChange = Number.isFinite(snapTodaysChange) && Number.isFinite(snapTodaysChangePerc);
+    if (hasApiChange) {
+      finalChange = snapTodaysChange;
+      finalChangePerc = snapTodaysChangePerc;
+    }
+    if (!hasApiChange && currentPrice > 0 && previousClose > 0) {
+      finalChange = currentPrice - previousClose;
+      finalChangePerc = (finalChange / previousClose) * 100;
+    }
+
+    // Fallback: when Polygon snapshot is not entitled (403) or returns no change, use Yahoo Finance
+    let fallbackPrice = currentPrice;
+    let fallbackPrevClose = previousClose;
+    let fallbackChange = finalChange;
+    let fallbackChangePerc = finalChangePerc;
+    const needsFallback = (currentPrice === 0 && previousClose === 0) || (finalChange === 0 && finalChangePerc === 0 && currentPrice > 0 && previousClose > 0 && currentPrice === previousClose);
+    if (needsFallback) {
+      try {
+        const yahooRes = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker.toUpperCase()}`, {
+          params: { range: '5d', interval: '1d', includePrePost: false },
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+          timeout: 15000,
+        });
+        const meta = yahooRes?.data?.chart?.result?.[0]?.meta || {};
+        const quotes = yahooRes?.data?.chart?.result?.[0]?.indicators?.quote?.[0] || {};
+        const closes = quotes.close || [];
+        let yPrice = meta.regularMarketPrice || 0;
+        let yPrev = meta.previousClose || 0;
+        if (closes.length >= 2) {
+          let lastIdx = -1;
+          for (let i = closes.length - 1; i >= 0; i--) {
+            if (closes[i] != null && closes[i] > 0) { lastIdx = i; break; }
+          }
+          if (lastIdx >= 0) {
+            if (!yPrice) yPrice = closes[lastIdx];
+            if (lastIdx > 0 && !yPrev) {
+              for (let i = lastIdx - 1; i >= 0; i--) {
+                if (closes[i] != null && closes[i] > 0) { yPrev = closes[i]; break; }
+              }
+            }
+          }
+        }
+        if (yPrice > 0 && yPrev > 0) {
+          fallbackPrice = yPrice;
+          fallbackPrevClose = yPrev;
+          fallbackChange = yPrice - yPrev;
+          fallbackChangePerc = (fallbackChange / yPrev) * 100;
+          console.log(`📊 Stock info ${ticker}: using Yahoo fallback for price/change (Polygon snapshot not entitled or no change)`);
+        }
+      } catch (yahooErr) {
+        console.warn(`⚠️ Yahoo fallback failed for ${ticker}:`, yahooErr.message);
+      }
+    }
+
+    const useFallback = needsFallback && fallbackPrice > 0 && fallbackPrevClose > 0;
+    const outPrice = useFallback ? fallbackPrice : currentPrice;
+    const outPrevClose = useFallback ? fallbackPrevClose : previousClose;
+    const outChange = useFallback ? fallbackChange : finalChange;
+    const outChangePerc = useFallback ? fallbackChangePerc : finalChangePerc;
 
     const responseData = {
       success: true,
@@ -210,34 +289,31 @@ app.get('/api/stock/:ticker/info', async (req, res) => {
       type: details.type || 'STOCK',
       marketCap: formatMarketCap(details.market_cap),
       marketCapRaw: details.market_cap || null,
-      // Price data - prefer snapshot for real-time accuracy
-      price: currentPrice,
-      open: snapshot.day?.o || prevClose.o || 0,
-      high: snapshot.day?.h || prevClose.h || 0,
-      low: snapshot.day?.l || prevClose.l || 0,
-      close: currentPrice,
-      volume: snapshot.day?.v || prevClose.v || 0,
-      prevClose: previousClose,
-      // Today's change (from snapshot if available)
-      todaysChange: todaysChange,
-      todaysChangePerc: todaysChangePerc,
-      // Additional info
+      price: outPrice,
+      open: snapshot.day?.o || snapshot.day?.open || aggsPrevOpen || 0,
+      high: snapshot.day?.h || snapshot.day?.high || aggsPrevHigh || 0,
+      low: snapshot.day?.l || snapshot.day?.low || aggsPrevLow || 0,
+      close: outPrice,
+      volume: snapshot.day?.v || snapshot.day?.volume || aggsPrevVolume || 0,
+      prevClose: outPrevClose,
+      todaysChange: outChange,
+      todaysChangePerc: outChangePerc,
       homepageUrl: details.homepage_url || null,
       totalEmployees: details.total_employees || null,
       listDate: details.list_date || null,
     };
 
-    console.log(`✅ Stock info fetched for ${ticker}:`, {
-      name: responseData.name,
-      exchange: responseData.exchange,
-      industry: responseData.industry,
-      marketCap: responseData.marketCap,
+    console.log(`✅ Stock info for ${ticker}:`, {
       price: responseData.price,
       prevClose: responseData.prevClose,
       change: responseData.todaysChange,
-      changePerc: responseData.todaysChangePerc
+      changePerc: responseData.todaysChangePerc,
+      source: useFallback ? 'yahoo_fallback' : 'polygon',
     });
 
+    // Prevent caching so live clients always get fresh price/prevClose (avoids 304 reusing stale zeros)
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     res.json(responseData);
   } catch (error) {
     console.error(`❌ Error fetching stock info for ${req.params.ticker}:`, error.message);

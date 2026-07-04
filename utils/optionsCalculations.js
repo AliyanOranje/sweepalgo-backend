@@ -108,7 +108,7 @@ async function getSpotPrice(ticker) {
     }
     lastSpotPriceRequest = Date.now();
     
-    // Fetch from API
+    // Fetch from Massive.com API (Polygon.io rebranded)
     const response = await axios.get(
       `https://api.massive.com/v2/aggs/ticker/${ticker}/prev`,
       {
@@ -657,6 +657,156 @@ function getMarketStatus() {
   };
 }
 
+/**
+ * ✅ FIX BUG #2: Generate Pro Tip text based on gamma sign and price position
+ * Replaces hardcoded "amplify moves" language with context-aware text
+ */
+function generateProTip(strike, gammaValue, spotPrice) {
+  // Format the value
+  const absValue = Math.abs(gammaValue);
+  const formattedValue = absValue >= 1000000 
+    ? `$${(absValue / 1000000).toFixed(1)}M` 
+    : absValue >= 1000
+    ? `$${(absValue / 1000).toFixed(0)}K`
+    : `$${absValue.toFixed(0)}`;
+  
+  // Check position
+  const isAbovePrice = strike > spotPrice;
+  
+  // Generate appropriate text based on gamma sign
+  if (gammaValue > 0) {
+    // Positive gamma = support or resistance (dampens moves)
+    if (isAbovePrice) {
+      return `$${strike} is KEY RESISTANCE with ${formattedValue} gamma. Price struggles to break above here. Expect choppy price action near this level.`;
+    } else {
+      return `$${strike} is KEY SUPPORT with ${formattedValue} gamma. Price bounces off this level. Hard to break below without strong volume.`;
+    }
+  } else {
+    // Negative gamma = breakout or breakdown zone (amplifies moves)
+    if (isAbovePrice) {
+      return `$${strike} is a BREAKOUT ZONE. If price pushes through, expect FAST upside movement. Watch for volume spike as confirmation.`;
+    } else {
+      return `$${strike} is a BREAKDOWN ZONE. If price drops through, expect FAST downside. Consider this level for your stop loss.`;
+    }
+  }
+}
+
+/**
+ * ✅ FIX BUG #3: GEX-aware setup score algorithm
+ * Properly rewards "high volatility bullish" setups (validated by PLTR: $147→$159)
+ * 
+ * Key insight: Negative GEX + bullish structure = STRONG setup, not weak
+ * Old algorithm penalized negative GEX. New one rewards it when structure is bullish.
+ */
+function calculateGEXSetupScore(ticker, spotPrice, gammaWallStrike, gammaWallValue, netGEX, gammaFlip) {
+  let score = 5.0; // Start neutral
+  let setupType = 'Neutral';
+  let interpretation = '';
+  
+  // RULE 1: Must have valid positive gamma wall
+  if (!gammaWallStrike || gammaWallValue <= 0) {
+    return {
+      score: 4.0,
+      type: 'No Clear Setup',
+      interpretation: 'No positive gamma concentration found. Wait for clearer structure.',
+      target: null,
+    };
+  }
+  
+  // RULE 2: Calculate distance to gamma wall
+  const distanceToWall = gammaWallStrike - spotPrice;
+  const distancePercent = (distanceToWall / spotPrice) * 100;
+  
+  // RULE 3: Determine if there's a clear directional setup
+  const hasRunway = distancePercent > 3 && distancePercent < 15; // 3-15% runway is ideal
+  const nearWall = Math.abs(distancePercent) < 3; // Very close to wall
+  const farFromWall = distancePercent > 15; // Too far to be relevant
+  
+  // RULE 4: Analyze net GEX
+  const isHighVolatility = netGEX < 0; // Negative = high volatility
+  const isStableEnvironment = netGEX > 50000000; // >50M positive = very stable
+  
+  // RULE 5: Bullish Setup Detection
+  if (spotPrice < gammaWallStrike) {
+    // Price below gamma wall = potential bullish setup
+    
+    if (hasRunway) {
+      // IDEAL: Clear runway to resistance
+      
+      if (isHighVolatility) {
+        // KEY INSIGHT: Negative GEX + bullish structure = HIGH VOLATILITY BULLISH
+        setupType = 'High Volatility Bullish';
+        score = 7.5; // Strong setup
+        interpretation = `Net GEX of $${(netGEX / 1000000).toFixed(1)}M amplifies moves. Price has ${distancePercent.toFixed(1)}% runway to $${gammaWallStrike} resistance. If bullish momentum starts, expect FAST upside. Target: $${gammaWallStrike}.`;
+        
+        // Bonus for perfect structure (5-10% distance is ideal)
+        if (distancePercent > 5 && distancePercent < 10) {
+          score += 0.5;
+        }
+        
+      } else if (isStableEnvironment) {
+        // Positive GEX + bullish structure = STABLE BULLISH
+        setupType = 'Bullish Coil';
+        score = 7.0;
+        interpretation = `Net GEX of $${(netGEX / 1000000).toFixed(1)}M provides stability. Price has ${distancePercent.toFixed(1)}% to $${gammaWallStrike} resistance. Expect steady grind higher. Target: $${gammaWallStrike}.`;
+        
+      } else {
+        // Moderate GEX
+        setupType = 'Moderate Bullish';
+        score = 6.5;
+        interpretation = `Price ${distancePercent.toFixed(1)}% below $${gammaWallStrike} resistance. Moderate bullish setup. Target: $${gammaWallStrike}.`;
+      }
+      
+    } else if (nearWall) {
+      // AT THE WALL - decision point
+      
+      if (isHighVolatility) {
+        setupType = 'Breakout Decision Point';
+        score = 7.0;
+        interpretation = `Price AT resistance ($${gammaWallStrike}). Negative net GEX means break above triggers FAST upside. Break below = fast downside. Watch for volume spike.`;
+      } else {
+        setupType = 'At Resistance';
+        score = 6.0;
+        interpretation = `Price at $${gammaWallStrike} resistance. Expect choppy consolidation. Wait for clear break.`;
+      }
+      
+    } else if (farFromWall) {
+      // Too far from wall to be relevant
+      setupType = 'No Clear Setup';
+      score = 5.0;
+      interpretation = `Price ${distancePercent.toFixed(1)}% below $${gammaWallStrike}. Too far from gamma wall to be immediately relevant.`;
+    }
+    
+  } else {
+    // Price ABOVE gamma wall
+    setupType = 'Above Resistance';
+    score = 5.5;
+    interpretation = `Price above $${gammaWallStrike} resistance. Expect consolidation or pullback to support.`;
+    
+    if (isHighVolatility) {
+      score -= 0.5;
+      interpretation += ' High volatility increases uncertainty.';
+    }
+  }
+  
+  // RULE 6: Cap score between 1 and 10
+  score = Math.min(10, Math.max(1, score));
+  
+  // RULE 7: Add "Strong" prefix if score is high enough
+  if (score >= 8.0) {
+    setupType = 'Strong ' + setupType;
+  } else if (score < 6.0 && !setupType.includes('No Clear')) {
+    setupType = 'Weak ' + setupType;
+  }
+  
+  return {
+    score: parseFloat(score.toFixed(1)),
+    type: setupType,
+    interpretation: interpretation,
+    target: gammaWallStrike,
+  };
+}
+
 export {
   parseOptionSymbol,
   getSpotPrice,
@@ -669,6 +819,8 @@ export {
   getDirectionArrow,
   detectOpeningClosing,
   calculateSetupScore,
+  calculateGEXSetupScore,
+  generateProTip,
   getMarketStatus,
   recentTradesMap,
 };
